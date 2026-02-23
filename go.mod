@@ -1,4 +1,4 @@
-module horosvec
+module github.com/hazyhaar/horosvec
 
 go 1.24.0
 
