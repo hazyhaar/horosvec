@@ -1,5 +1,7 @@
 # CLAUDE.md — horosvec
 
+> **Règle n°1** — Un bug trouvé en audit mais pas par un test est d'abord une faille de test. Écrire le test rouge, puis fixer. Pas de fix sans test.
+
 ## Description
 
 Bibliothèque Go standalone de recherche vectorielle ANN (Approximate Nearest Neighbor) utilisant :
