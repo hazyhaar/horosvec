@@ -6,6 +6,7 @@ import "sync"
 // cachedNode holds graph node data in the LRU cache.
 type cachedNode struct {
 	nodeID    int64
+	extID     []byte    // external ID for result mapping
 	neighbors []int64
 	vec       []float32 // raw vector for exact L2 during search
 	code      []byte    // RaBitQ 1-bit code
@@ -34,7 +35,8 @@ func newNodeCache(capacity int) *nodeCache {
 	}
 }
 
-// get retrieves a node from the cache. Returns nil if not found.
+// get retrieves a node from the cache and promotes it in the LRU.
+// Returns nil if not found.
 func (c *nodeCache) get(nodeID int64) *cachedNode {
 	c.mu.RLock()
 	node, ok := c.items[nodeID]
@@ -49,6 +51,17 @@ func (c *nodeCache) get(nodeID int64) *cachedNode {
 	return node
 }
 
+// getReadOnly retrieves a node without updating LRU order.
+// Safe for concurrent readers — only takes a read lock.
+// Use on hot search paths where LRU promotion is not needed
+// (cache is typically warm and no eviction occurs during search).
+func (c *nodeCache) getReadOnly(nodeID int64) *cachedNode {
+	c.mu.RLock()
+	node := c.items[nodeID]
+	c.mu.RUnlock()
+	return node
+}
+
 // put adds or updates a node in the cache.
 func (c *nodeCache) put(node *cachedNode) {
 	c.mu.Lock()
@@ -56,6 +69,7 @@ func (c *nodeCache) put(node *cachedNode) {
 
 	if existing, ok := c.items[node.nodeID]; ok {
 		// Update existing
+		existing.extID = node.extID
 		existing.neighbors = node.neighbors
 		existing.vec = node.vec
 		existing.code = node.code
