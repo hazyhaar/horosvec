@@ -63,9 +63,9 @@ type Index struct {
 	cache    *nodeCache
 	encoder  *Encoder
 	centroid *CentroidTracker
-	medoid   int32
+	medoid   int64
 	dim      int
-	nextID   int32
+	nextID   int64
 	built    bool
 
 	mu        sync.RWMutex // protects searches vs. structural changes
@@ -74,6 +74,10 @@ type Index struct {
 
 // New creates or loads an Index from the given database.
 func New(db *sql.DB, cfg Config) (*Index, error) {
+	if err := configureSQLite(db); err != nil {
+		return nil, fmt.Errorf("horosvec: configure sqlite: %w", err)
+	}
+
 	if err := initSchema(db); err != nil {
 		return nil, fmt.Errorf("horosvec: init schema: %w", err)
 	}
@@ -156,7 +160,7 @@ func (idx *Index) Build(ctx context.Context, iter VectorIterator) error {
 	for i, v := range allVecs {
 		code, sqNorm, l1Norm := idx.encoder.Encode(v)
 		nodes[i] = graphNode{
-			id:     int32(i),
+			id:     int64(i),
 			extID:  allIDs[i],
 			vec:    v,
 			code:   code,
@@ -179,14 +183,14 @@ func (idx *Index) Build(ctx context.Context, iter VectorIterator) error {
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.Exec("DELETE FROM vec_nodes"); err != nil {
+	if _, err := tx.Exec("DELETE FROM vindex_nodes"); err != nil {
 		return fmt.Errorf("horosvec: clear nodes: %w", err)
 	}
-	if _, err := tx.Exec("DELETE FROM vec_meta"); err != nil {
+	if _, err := tx.Exec("DELETE FROM vindex_meta"); err != nil {
 		return fmt.Errorf("horosvec: clear meta: %w", err)
 	}
 
-	if err := saveGraph(tx, "vec_nodes", nodes, idx.medoid, dim, idx.cfg.MaxDegree, centroid); err != nil {
+	if err := saveGraph(tx, nodes, idx.medoid, dim, idx.cfg.MaxDegree, centroid); err != nil {
 		return fmt.Errorf("horosvec: save graph: %w", err)
 	}
 
@@ -194,7 +198,7 @@ func (idx *Index) Build(ctx context.Context, iter VectorIterator) error {
 		return fmt.Errorf("horosvec: commit: %w", err)
 	}
 
-	idx.nextID = int32(len(nodes))
+	idx.nextID = int64(len(nodes))
 	idx.built = true
 
 	// Populate cache
@@ -237,7 +241,7 @@ func (idx *Index) Search(query []float32, topK int) ([]Result, error) {
 
 // bruteForceSearch scans all vectors with exact L2. 100% recall, O(N).
 func (idx *Index) bruteForceSearch(query []float32, topK int) ([]Result, error) {
-	rows, err := idx.db.Query("SELECT ext_id, vector FROM vec_nodes")
+	rows, err := idx.db.Query("SELECT ext_id, vector FROM vindex_nodes")
 	if err != nil {
 		return nil, fmt.Errorf("horosvec: brute force scan: %w", err)
 	}
@@ -308,7 +312,7 @@ func (idx *Index) vamanaSearch(query []float32, topK int) ([]Result, error) {
 	results := make([]Result, len(candidates))
 	for i, c := range candidates {
 		var extID []byte
-		err := idx.db.QueryRow("SELECT ext_id FROM vec_nodes WHERE node_id = ?", c.nodeID).Scan(&extID)
+		err := idx.db.QueryRow("SELECT ext_id FROM vindex_nodes WHERE node_id = ?", c.nodeID).Scan(&extID)
 		if err != nil {
 			continue
 		}
@@ -335,7 +339,7 @@ func sortResults(results []Result) {
 // Uses RaBitQ asymmetric distances for fast approximate graph navigation.
 // The query is centered once and reused for all distance computations.
 func (idx *Index) rabitqGreedySearch(query []float32, L int) []searchCandidate {
-	visited := make(map[int32]bool)
+	visited := make(map[int64]bool)
 
 	// Pre-compute query centering and squared norm (reused for every RaBitQ distance)
 	queryCentered := make([]float64, idx.dim)
@@ -496,11 +500,11 @@ func (idx *Index) Insert(vecs [][]float32, ids [][]byte) error {
 
 		code, sqNorm, l1Norm := idx.encoder.Encode(vec)
 
-		if err := saveNode(tx, "vec_nodes", nodeID, ids[i], nil, vec, code, sqNorm, l1Norm); err != nil {
+		if err := saveNode(tx, nodeID, ids[i], nil, vec, code, sqNorm, l1Norm); err != nil {
 			return fmt.Errorf("horosvec: save new node: %w", err)
 		}
 
-		getNeighbors := func(id int32) []int32 {
+		getNeighbors := func(id int64) []int64 {
 			if id == nodeID {
 				return nil
 			}
@@ -511,8 +515,8 @@ func (idx *Index) Insert(vecs [][]float32, ids [][]byte) error {
 			return n.neighbors
 		}
 
-		setNeighbors := func(id int32, neighbors []int32) {
-			if err := updateNeighbors(tx, "vec_nodes", id, neighbors); err != nil {
+		setNeighbors := func(id int64, neighbors []int64) {
+			if err := updateNeighbors(tx, id, neighbors); err != nil {
 				return
 			}
 			if cached := idx.cache.get(id); cached != nil {
@@ -523,7 +527,7 @@ func (idx *Index) Insert(vecs [][]float32, ids [][]byte) error {
 		// Find nearest neighbors via rabitq search
 		candidates := idx.rabitqGreedySearch(vec, idx.cfg.SearchListSize)
 
-		neighbors := make([]int32, 0, idx.cfg.MaxDegree)
+		neighbors := make([]int64, 0, idx.cfg.MaxDegree)
 		for _, c := range candidates {
 			if len(neighbors) >= idx.cfg.MaxDegree {
 				break
@@ -592,10 +596,6 @@ func (idx *Index) RebuildAsync(ctx context.Context, iter VectorIterator) {
 }
 
 func (idx *Index) rebuildInternal(ctx context.Context, iter VectorIterator) {
-	if err := initSchemaNew(idx.db); err != nil {
-		return
-	}
-
 	var allVecs [][]float32
 	var allIDs [][]byte
 	for {
@@ -634,7 +634,7 @@ func (idx *Index) rebuildInternal(ctx context.Context, iter VectorIterator) {
 	for i, v := range allVecs {
 		code, sqNorm, l1Norm := enc.Encode(v)
 		nodes[i] = graphNode{
-			id:     int32(i),
+			id:     int64(i),
 			extID:  allIDs[i],
 			vec:    v,
 			code:   code,
@@ -655,7 +655,17 @@ func (idx *Index) rebuildInternal(ctx context.Context, iter VectorIterator) {
 		return
 	}
 
-	if err := saveGraph(tx, "vec_nodes_new", nodes, medoid, dim, idx.cfg.MaxDegree, centroid); err != nil {
+	// Clear and rebuild in-place
+	if _, err := tx.Exec("DELETE FROM vindex_nodes"); err != nil {
+		tx.Rollback()
+		return
+	}
+	if _, err := tx.Exec("DELETE FROM vindex_meta"); err != nil {
+		tx.Rollback()
+		return
+	}
+
+	if err := saveGraph(tx, nodes, medoid, dim, idx.cfg.MaxDegree, centroid); err != nil {
 		tx.Rollback()
 		return
 	}
@@ -667,14 +677,10 @@ func (idx *Index) rebuildInternal(ctx context.Context, iter VectorIterator) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
-	if err := swapIndex(idx.db); err != nil {
-		return
-	}
-
 	idx.medoid = medoid
 	idx.dim = dim
 	idx.encoder = enc
-	idx.nextID = int32(len(nodes))
+	idx.nextID = int64(len(nodes))
 	idx.centroid = NewCentroidTracker(dim, idx.cfg.DriftThreshold, idx.cfg.InsertRatioThreshold)
 	idx.centroid.AddBatch(allVecs)
 	idx.centroid.SnapshotBuild()

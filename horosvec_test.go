@@ -44,10 +44,6 @@ func newTestDB(t *testing.T) *sql.DB {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = db.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL")
-	if err != nil {
-		t.Fatal(err)
-	}
 	t.Cleanup(func() { db.Close() })
 	return db
 }
@@ -234,7 +230,6 @@ func TestPersistenceRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		db.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000")
 
 		idx, err := New(db, cfg)
 		if err != nil {
@@ -257,7 +252,6 @@ func TestPersistenceRoundTrip(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer db.Close()
-		db.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000")
 
 		idx, err := New(db, cfg)
 		if err != nil {
@@ -427,7 +421,6 @@ func BenchmarkBuild10K(b *testing.B) {
 		dir, _ := os.MkdirTemp("", "horosvec-bench-*")
 		dbPath := filepath.Join(dir, "bench.db")
 		db, _ := sql.Open("sqlite", dbPath)
-		db.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL")
 
 		cfg := DefaultConfig()
 		idx, _ := New(db, cfg)
@@ -455,7 +448,6 @@ func BenchmarkSearch10K(b *testing.B) {
 	dbPath := filepath.Join(dir, "bench.db")
 	db, _ := sql.Open("sqlite", dbPath)
 	defer db.Close()
-	db.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL")
 
 	cfg := DefaultConfig()
 	cfg.CacheCapacity = 20000

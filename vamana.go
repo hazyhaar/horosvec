@@ -10,10 +10,10 @@ import (
 
 // graphNode represents a node in the Vamana graph during construction.
 type graphNode struct {
-	id        int32
+	id        int64
 	extID     []byte
 	vec       []float32
-	neighbors []int32
+	neighbors []int64
 	code      []byte
 	sqNorm    float64
 	l1Norm    float64
@@ -63,7 +63,7 @@ func cosineSimilarity(a, b []float32) float64 {
 // --- priority queue for greedy search ---
 
 type searchCandidate struct {
-	nodeID int32
+	nodeID int64
 	dist   float64
 }
 
@@ -82,7 +82,7 @@ func (h *candidateHeap) Pop() interface{} {
 }
 
 // findMedoid finds the node closest to the centroid of all vectors.
-func findMedoid(nodes []graphNode) int32 {
+func findMedoid(nodes []graphNode) int64 {
 	if len(nodes) == 0 {
 		return 0
 	}
@@ -117,12 +117,12 @@ func findMedoid(nodes []graphNode) int32 {
 // getNeighbors returns the neighbor list for a given nodeID.
 func greedySearch(
 	query []float32,
-	start int32,
+	start int64,
 	L int,
-	getVec func(int32) []float32,
-	getNeighbors func(int32) []int32,
-) (candidates []searchCandidate, visited map[int32]bool) {
-	visited = make(map[int32]bool)
+	getVec func(int64) []float32,
+	getNeighbors func(int64) []int64,
+) (candidates []searchCandidate, visited map[int64]bool) {
+	visited = make(map[int64]bool)
 
 	// Initialize with start node
 	startVec := getVec(start)
@@ -203,14 +203,14 @@ func insertSorted(sorted []searchCandidate, c searchCandidate) []searchCandidate
 // candidates should include the node's current neighbors and new candidates.
 // alpha > 1 promotes longer edges for better graph connectivity.
 func robustPrune(
-	nodeID int32,
+	nodeID int64,
 	candidates []searchCandidate,
 	alpha float64,
 	R int,
-	getVec func(int32) []float32,
-) []int32 {
+	getVec func(int64) []float32,
+) []int64 {
 	// Remove self and duplicates
-	seen := map[int32]bool{nodeID: true}
+	seen := map[int64]bool{nodeID: true}
 	filtered := make([]searchCandidate, 0, len(candidates))
 	for _, c := range candidates {
 		if seen[c.nodeID] {
@@ -223,7 +223,7 @@ func robustPrune(
 	// Sort by distance
 	sortCandidates(filtered)
 
-	result := make([]int32, 0, R)
+	result := make([]int64, 0, R)
 	nodeVec := getVec(nodeID)
 	if nodeVec == nil {
 		return result
@@ -279,7 +279,7 @@ func sortCandidates(candidates []searchCandidate) {
 func buildGraph(
 	ctx context.Context,
 	nodes []graphNode,
-	medoid int32,
+	medoid int64,
 	R int,
 	L int,
 	alpha float64,
@@ -291,13 +291,13 @@ func buildGraph(
 	}
 
 	// Slice-based access for O(1) lookup (nodes have IDs 0..n-1)
-	getVec := func(id int32) []float32 {
+	getVec := func(id int64) []float32 {
 		if id >= 0 && int(id) < n {
 			return nodes[id].vec
 		}
 		return nil
 	}
-	getNeighbors := func(id int32) []int32 {
+	getNeighbors := func(id int64) []int64 {
 		if id >= 0 && int(id) < n {
 			return nodes[id].neighbors
 		}
@@ -312,9 +312,9 @@ func buildGraph(
 		nNeighbors = n - 1
 	}
 	// Reusable buffer for sampling random neighbors
-	pool := make([]int32, n)
+	pool := make([]int64, n)
 	for i := range n {
-		pool[i] = int32(i)
+		pool[i] = int64(i)
 	}
 	for i := range n {
 		node := &nodes[i]
@@ -327,7 +327,7 @@ func buildGraph(
 		pool[myIdx], pool[n-1] = pool[n-1], pool[myIdx]
 
 		// Pick nNeighbors from pool[0..n-2]
-		node.neighbors = make([]int32, nNeighbors)
+		node.neighbors = make([]int64, nNeighbors)
 		for j := range nNeighbors {
 			ri := rng.IntN(n - 1 - j)
 			node.neighbors[j] = pool[ri]
@@ -343,7 +343,7 @@ func buildGraph(
 		}
 		// Re-initialize pool for next node (simple and correct)
 		for j := range n {
-			pool[j] = int32(j)
+			pool[j] = int64(j)
 		}
 	}
 
@@ -390,7 +390,7 @@ func buildGraph(
 
 			// Add reverse edges (simplified: just append, don't prune unless over 2R)
 			for _, nbr := range newNeighbors {
-				if int(nbr) < 0 || int(nbr) >= n {
+				if nbr < 0 || int(nbr) >= n {
 					continue
 				}
 				nbrNode := &nodes[nbr]
@@ -447,13 +447,13 @@ func buildGraph(
 // 3. Adding reverse edges
 func insertNode(
 	newNode *graphNode,
-	medoid int32,
+	medoid int64,
 	R int,
 	L int,
 	alpha float64,
-	getVec func(int32) []float32,
-	getNeighbors func(int32) []int32,
-	setNeighbors func(int32, []int32),
+	getVec func(int64) []float32,
+	getNeighbors func(int64) []int64,
+	setNeighbors func(int64, []int64),
 ) {
 	// Greedy search from medoid
 	candidates, _ := greedySearch(newNode.vec, medoid, L, getVec, getNeighbors)
