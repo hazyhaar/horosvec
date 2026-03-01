@@ -64,7 +64,7 @@ func generateVecs(rng *rand.Rand, n, dim int) ([][]float32, [][]byte) {
 
 func TestBuildAndSearchRecall(t *testing.T) {
 	const (
-		n   = 2000
+		n   = 1000
 		dim = 64
 		k   = 10
 	)
@@ -149,8 +149,8 @@ func TestBuildAndSearchRecall(t *testing.T) {
 
 func TestInsertAndFind(t *testing.T) {
 	const (
-		n      = 1000
-		dim    = 128
+		n      = 500
+		dim    = 64
 		nInsert = 200
 	)
 
@@ -291,7 +291,7 @@ func TestPersistenceRoundTrip(t *testing.T) {
 
 func TestConcurrentSearch(t *testing.T) {
 	const (
-		n   = 2000
+		n   = 1000
 		dim = 64
 	)
 

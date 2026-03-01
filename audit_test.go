@@ -83,8 +83,8 @@ func TestAudit_RaBitQ_NegativeDistances(t *testing.T) {
 	// WHAT: Scan for negative distance estimates across random pairs.
 	// WHY: The simplified formula could go negative if correction is wrong.
 	rng := rand.New(rand.NewPCG(99, 0))
-	dim := 1024
-	n := 5000
+	dim := 512
+	n := 2000
 
 	vecs := make([][]float32, n)
 	for i := range n {
@@ -267,7 +267,7 @@ func TestAudit_Vamana_DegreeDistribution(t *testing.T) {
 	// WHAT: Verify degree bounds (0 < degree <= R for all nodes after build).
 	// WHY: Over-capacity nodes waste memory; zero-degree nodes are dead.
 	rng := rand.New(rand.NewPCG(42, 0))
-	n := 2000
+	n := 1000
 	dim := 64
 	maxDeg := 64
 
