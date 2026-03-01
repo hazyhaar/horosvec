@@ -1,3 +1,4 @@
+// CLAUDE:SUMMARY Binary serialization helpers for int32, float32, float64, and int64 slices (little-endian).
 package horosvec
 
 import (

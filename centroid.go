@@ -1,3 +1,4 @@
+// CLAUDE:SUMMARY Running-average centroid tracker with drift detection to trigger index rebuilds.
 package horosvec
 
 import "math"

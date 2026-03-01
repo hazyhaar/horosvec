@@ -1,3 +1,4 @@
+// CLAUDE:SUMMARY Public API for the Vamana+RaBitQ ANN index: build, search, insert, and async rebuild.
 package horosvec
 
 import (
@@ -5,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"sync"
 
 	_ "modernc.org/sqlite"
@@ -15,9 +17,11 @@ type Config struct {
 	MaxDegree      int // R: max neighbors per node (default 64)
 	SearchListSize int // L: beam width during build (default 128)
 	BuildPasses    int // number of graph construction passes (default 2)
-	EfSearch       int // beam width during search (default 64)
-	RerankTopN     int // top-N candidates to rerank with exact vectors (default 50)
+	EfSearch       int // beam width during search (default 128)
+	RerankTopN     int // top-N candidates to rerank with exact vectors (default 500)
 	CacheCapacity  int // LRU cache capacity in nodes (default 100000)
+
+	BruteForceThreshold int // below this count, skip Vamana and scan all vectors (default 50000)
 
 	Alpha                float64 // pruning parameter, >1 for longer edges (default 1.2)
 	DriftThreshold       float64 // centroid drift ratio to trigger rebuild (default 0.05)
@@ -30,9 +34,10 @@ func DefaultConfig() Config {
 		MaxDegree:            64,
 		SearchListSize:       128,
 		BuildPasses:          2,
-		EfSearch:             64,
-		RerankTopN:           50,
+		EfSearch:             128,
+		RerankTopN:           500,
 		CacheCapacity:        100_000,
+		BruteForceThreshold:  50_000,
 		Alpha:                1.2,
 		DriftThreshold:       0.05,
 		InsertRatioThreshold: 0.30,
@@ -208,7 +213,9 @@ func (idx *Index) Build(ctx context.Context, iter VectorIterator) error {
 	return nil
 }
 
-// Search finds the topK nearest neighbors using RaBitQ approximate distances.
+// Search finds the topK nearest neighbors.
+// For small indices (<= BruteForceThreshold): exact brute-force scan, 100% recall.
+// For large indices: 2-stage RaBitQ beam search + L2 rerank.
 func (idx *Index) Search(query []float32, topK int) ([]Result, error) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
@@ -220,12 +227,79 @@ func (idx *Index) Search(query []float32, topK int) ([]Result, error) {
 		return nil, fmt.Errorf("horosvec: query dim %d != index dim %d", len(query), idx.dim)
 	}
 
-	efSearch := idx.cfg.EfSearch
-	if efSearch < topK {
-		efSearch = topK
+	// Dynamic threshold: brute-force for small shards, Vamana+RaBitQ for large
+	if idx.cfg.BruteForceThreshold > 0 && int(idx.nextID) <= idx.cfg.BruteForceThreshold {
+		return idx.bruteForceSearch(query, topK)
 	}
 
+	return idx.vamanaSearch(query, topK)
+}
+
+// bruteForceSearch scans all vectors with exact L2. 100% recall, O(N).
+func (idx *Index) bruteForceSearch(query []float32, topK int) ([]Result, error) {
+	rows, err := idx.db.Query("SELECT ext_id, vector FROM vec_nodes")
+	if err != nil {
+		return nil, fmt.Errorf("horosvec: brute force scan: %w", err)
+	}
+	defer rows.Close()
+
+	best := make([]Result, 0, topK+1)
+	worstDist := math.MaxFloat64
+
+	for rows.Next() {
+		var extID, vecBlob []byte
+		if err := rows.Scan(&extID, &vecBlob); err != nil {
+			continue
+		}
+		vec := deserializeFloat32s(vecBlob)
+		d := l2DistanceSquared(query, vec)
+
+		if len(best) < topK || d < worstDist {
+			idCopy := make([]byte, len(extID))
+			copy(idCopy, extID)
+			best = append(best, Result{ID: idCopy, Score: d})
+			sortResults(best)
+			if len(best) > topK {
+				best = best[:topK]
+			}
+			worstDist = best[len(best)-1].Score
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("horosvec: brute force scan: %w", err)
+	}
+
+	return best, nil
+}
+
+// vamanaSearch does 2-stage RaBitQ beam search + L2 rerank.
+func (idx *Index) vamanaSearch(query []float32, topK int) ([]Result, error) {
+	// Determine beam width: wide enough for re-ranking
+	rerankN := idx.cfg.RerankTopN
+	if rerankN < topK*3 {
+		rerankN = topK * 3
+	}
+	efSearch := idx.cfg.EfSearch
+	if efSearch < rerankN {
+		efSearch = rerankN
+	}
+
+	// Stage 1: RaBitQ beam search (approximate distances)
 	candidates := idx.rabitqGreedySearch(query, efSearch)
+
+	// Stage 2: Re-rank top candidates with exact L2
+	if len(candidates) > rerankN {
+		candidates = candidates[:rerankN]
+	}
+	for i := range candidates {
+		node, err := loadNode(idx.db, idx.cache, candidates[i].nodeID)
+		if err != nil {
+			candidates[i].dist = math.MaxFloat64
+			continue
+		}
+		candidates[i].dist = l2DistanceSquared(query, node.vec)
+	}
+	sortCandidates(candidates)
 
 	if len(candidates) > topK {
 		candidates = candidates[:topK]
@@ -244,10 +318,33 @@ func (idx *Index) Search(query []float32, topK int) ([]Result, error) {
 	return results, nil
 }
 
+// sortResults sorts results by score (ascending).
+func sortResults(results []Result) {
+	for i := 1; i < len(results); i++ {
+		key := results[i]
+		j := i - 1
+		for j >= 0 && results[j].Score > key.Score {
+			results[j+1] = results[j]
+			j--
+		}
+		results[j+1] = key
+	}
+}
+
 // rabitqGreedySearch performs best-first beam search on the Vamana graph.
-// Uses exact L2 distances from cached vectors for accurate graph navigation.
+// Uses RaBitQ asymmetric distances for fast approximate graph navigation.
+// The query is centered once and reused for all distance computations.
 func (idx *Index) rabitqGreedySearch(query []float32, L int) []searchCandidate {
 	visited := make(map[int32]bool)
+
+	// Pre-compute query centering and squared norm (reused for every RaBitQ distance)
+	queryCentered := make([]float64, idx.dim)
+	var querySqNorm float64
+	for i := range idx.dim {
+		c := float64(query[i]) - float64(idx.encoder.centroid[i])
+		queryCentered[i] = c
+		querySqNorm += c * c
+	}
 
 	medoidNode, err := loadNode(idx.db, idx.cache, idx.medoid)
 	if err != nil {
@@ -255,7 +352,7 @@ func (idx *Index) rabitqGreedySearch(query []float32, L int) []searchCandidate {
 	}
 	visited[idx.medoid] = true
 
-	startDist := l2DistanceSquared(query, medoidNode.vec)
+	startDist := rabitqDistanceAsymPrecomp(queryCentered, querySqNorm, medoidNode.code, medoidNode.sqNorm, medoidNode.l1Norm)
 
 	h := &candidateHeap{{nodeID: idx.medoid, dist: startDist}}
 	heap.Init(h)
@@ -286,7 +383,7 @@ func (idx *Index) rabitqGreedySearch(query []float32, L int) []searchCandidate {
 				continue
 			}
 
-			d := l2DistanceSquared(query, nbrNode.vec)
+			d := rabitqDistanceAsymPrecomp(queryCentered, querySqNorm, nbrNode.code, nbrNode.sqNorm, nbrNode.l1Norm)
 
 			if len(best) < L || d < worstBest {
 				heap.Push(h, searchCandidate{nodeID: nbr, dist: d})

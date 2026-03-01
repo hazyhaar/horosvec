@@ -1,3 +1,4 @@
+// CLAUDE:SUMMARY RaBitQ 1-bit vector quantization encoder and asymmetric/symmetric distance functions.
 package horosvec
 
 import (
