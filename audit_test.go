@@ -651,16 +651,21 @@ func BenchmarkVamana_Search_10K(b *testing.B) {
 	db := newTestDB2(b)
 	cfg := DefaultConfig()
 	cfg.CacheCapacity = 20000
-	idx, _ := New(db, cfg)
+	idx, err := New(db, cfg)
+	if err != nil {
+		b.Fatal(err)
+	}
 	defer idx.Close()
 
 	iter := &sliceIterator{vecs: vecs, ids: ids}
-	idx.Build(context.Background(), iter)
+	if err := idx.Build(context.Background(), iter); err != nil {
+		b.Fatal(err)
+	}
 
 	query := vecs[0]
 	b.ResetTimer()
 	for b.Loop() {
-		idx.Search(query, 10)
+		_, _ = idx.Search(query, 10)
 	}
 }
 

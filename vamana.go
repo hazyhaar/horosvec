@@ -44,22 +44,6 @@ func l2DistanceSquared(a, b []float32) float64 {
 	return sum
 }
 
-// cosineSimilarity computes cosine similarity between two vectors.
-func cosineSimilarity(a, b []float32) float64 {
-	var dot, normA, normB float64
-	for i := range a {
-		ai, bi := float64(a[i]), float64(b[i])
-		dot += ai * bi
-		normA += ai * ai
-		normB += bi * bi
-	}
-	denom := math.Sqrt(normA) * math.Sqrt(normB)
-	if denom == 0 {
-		return 0
-	}
-	return dot / denom
-}
-
 // --- priority queue for greedy search ---
 
 type searchCandidate struct {
@@ -441,68 +425,3 @@ func buildGraph(
 	}
 }
 
-// insertNode inserts a new node into an existing Vamana graph by:
-// 1. Greedy searching for its nearest neighbors
-// 2. Robust pruning to select edges
-// 3. Adding reverse edges
-func insertNode(
-	newNode *graphNode,
-	medoid int64,
-	R int,
-	L int,
-	alpha float64,
-	getVec func(int64) []float32,
-	getNeighbors func(int64) []int64,
-	setNeighbors func(int64, []int64),
-) {
-	// Greedy search from medoid
-	candidates, _ := greedySearch(newNode.vec, medoid, L, getVec, getNeighbors)
-
-	// Robust prune to select neighbors
-	newNode.neighbors = robustPrune(newNode.id, candidates, alpha, R, getVec)
-	setNeighbors(newNode.id, newNode.neighbors)
-
-	// Add reverse edges
-	for _, nbr := range newNode.neighbors {
-		nbrNeighbors := getNeighbors(nbr)
-		if nbrNeighbors == nil {
-			continue
-		}
-
-		// Check if reverse edge exists
-		found := false
-		for _, nn := range nbrNeighbors {
-			if nn == newNode.id {
-				found = true
-				break
-			}
-		}
-		if found {
-			continue
-		}
-
-		if len(nbrNeighbors) < R {
-			setNeighbors(nbr, append(nbrNeighbors, newNode.id))
-		} else {
-			// Need to prune
-			cands := make([]searchCandidate, 0, len(nbrNeighbors)+1)
-			nbrVec := getVec(nbr)
-			for _, nn := range nbrNeighbors {
-				nnVec := getVec(nn)
-				if nnVec != nil && nbrVec != nil {
-					cands = append(cands, searchCandidate{
-						nodeID: nn,
-						dist:   l2DistanceSquared(nbrVec, nnVec),
-					})
-				}
-			}
-			if nbrVec != nil {
-				cands = append(cands, searchCandidate{
-					nodeID: newNode.id,
-					dist:   l2DistanceSquared(nbrVec, newNode.vec),
-				})
-			}
-			setNeighbors(nbr, robustPrune(nbr, cands, alpha, R, getVec))
-		}
-	}
-}
