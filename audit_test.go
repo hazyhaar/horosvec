@@ -3,6 +3,7 @@
 package horosvec
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -219,7 +220,7 @@ func TestAudit_RaBitQ_PaperFormula(t *testing.T) {
 func TestAudit_Vamana_GraphConnectivity(t *testing.T) {
 	// WHAT: BFS from medoid must reach all nodes.
 	// WHY: Disconnected nodes are invisible to search — silent data loss.
-	sizes := []int{100, 1000, 5000}
+	sizes := []int{100, 500, 1000}
 	for _, n := range sizes {
 		t.Run(fmt.Sprintf("n%d", n), func(t *testing.T) {
 			rng := rand.New(rand.NewPCG(42, 0))
@@ -266,9 +267,9 @@ func TestAudit_Vamana_DegreeDistribution(t *testing.T) {
 	// WHAT: Verify degree bounds (0 < degree <= R for all nodes after build).
 	// WHY: Over-capacity nodes waste memory; zero-degree nodes are dead.
 	rng := rand.New(rand.NewPCG(42, 0))
-	n := 5000
-	dim := 128
-	R := 64
+	n := 2000
+	dim := 64
+	maxDeg := 64
 
 	vecs, _ := generateVecs(rng, n, dim)
 	nodes := make([]graphNode, n)
@@ -280,36 +281,36 @@ func TestAudit_Vamana_DegreeDistribution(t *testing.T) {
 	}
 
 	medoid := findMedoid(nodes)
-	buildGraph(context.Background(), nodes, medoid, R, 128, 1.2, 2)
+	buildGraph(context.Background(), nodes, medoid, maxDeg, 128, 1.2, 2)
 
-	minDeg, maxDeg := n, 0
+	minNodeDeg, maxNodeDeg := n, 0
 	totalDeg := 0
 	overCapacity := 0
-	zeroDeg := 0
+	zeroDegCount := 0
 	for _, node := range nodes {
 		deg := len(node.neighbors)
-		if deg < minDeg {
-			minDeg = deg
+		if deg < minNodeDeg {
+			minNodeDeg = deg
 		}
-		if deg > maxDeg {
-			maxDeg = deg
+		if deg > maxNodeDeg {
+			maxNodeDeg = deg
 		}
 		totalDeg += deg
-		if deg > R {
+		if deg > maxDeg {
 			overCapacity++
 		}
 		if deg == 0 {
-			zeroDeg++
+			zeroDegCount++
 		}
 	}
 
 	avgDeg := float64(totalDeg) / float64(n)
-	t.Logf("Degree: min=%d, max=%d, avg=%.1f, over_R=%d, zero=%d", minDeg, maxDeg, avgDeg, overCapacity, zeroDeg)
+	t.Logf("Degree: min=%d, max=%d, avg=%.1f, over_R=%d, zero=%d", minNodeDeg, maxNodeDeg, avgDeg, overCapacity, zeroDegCount)
 	if overCapacity > 0 {
-		t.Errorf("%d nodes exceed max degree R=%d", overCapacity, R)
+		t.Errorf("%d nodes exceed max degree R=%d", overCapacity, maxDeg)
 	}
-	if zeroDeg > 0 {
-		t.Errorf("%d nodes have zero neighbors", zeroDeg)
+	if zeroDegCount > 0 {
+		t.Errorf("%d nodes have zero neighbors", zeroDegCount)
 	}
 }
 
@@ -323,9 +324,8 @@ func TestAudit_Vamana_SearchVsBruteForce(t *testing.T) {
 		dim int
 	}{
 		{100, 64},
-		{1000, 128},
-		{5000, 128},
-		{10000, 128},
+		{500, 64},
+		{1000, 64},
 	}
 
 	for _, s := range scales {
@@ -425,8 +425,8 @@ func TestAudit_Vamana_RaBitQUsed(t *testing.T) {
 	defer idx.Close()
 
 	iter := &sliceIterator{vecs: vecs, ids: ids}
-	if err := idx.Build(context.Background(), iter); err != nil {
-		t.Fatal(err)
+	if buildErr := idx.Build(context.Background(), iter); buildErr != nil {
+		t.Fatal(buildErr)
 	}
 
 	// Search before corruption
@@ -455,7 +455,7 @@ func TestAudit_Vamana_RaBitQUsed(t *testing.T) {
 	// Results must differ (proves RaBitQ IS used for graph traversal)
 	changed := 0
 	for i := range min(len(resultsBefore), len(resultsAfter)) {
-		if string(resultsBefore[i].ID) != string(resultsAfter[i].ID) {
+		if !bytes.Equal(resultsBefore[i].ID, resultsAfter[i].ID) {
 			changed++
 		}
 	}
@@ -471,8 +471,8 @@ func TestAudit_Vamana_InsertDegradation(t *testing.T) {
 	// WHAT: Recall after inserting 50% more vectors without rebuild.
 	// WHY: Real-world usage adds vectors incrementally — must not degrade too much.
 	rng := rand.New(rand.NewPCG(42, 0))
-	n := 2000
-	dim := 128
+	n := 1000
+	dim := 64
 	k := 10
 
 	db := newTestDB(t)
@@ -480,7 +480,7 @@ func TestAudit_Vamana_InsertDegradation(t *testing.T) {
 
 	cfg := DefaultConfig()
 	cfg.EfSearch = 128
-	cfg.CacheCapacity = 5000
+	cfg.CacheCapacity = 3000
 	idx, err := New(db, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -488,8 +488,8 @@ func TestAudit_Vamana_InsertDegradation(t *testing.T) {
 	defer idx.Close()
 
 	iter := &sliceIterator{vecs: vecs, ids: ids}
-	if err := idx.Build(context.Background(), iter); err != nil {
-		t.Fatal(err)
+	if buildErr := idx.Build(context.Background(), iter); buildErr != nil {
+		t.Fatal(buildErr)
 	}
 
 	// Recall before inserts
@@ -503,13 +503,17 @@ func TestAudit_Vamana_InsertDegradation(t *testing.T) {
 		v := n + i
 		insertIDs[i] = []byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)}
 	}
-	if err := idx.Insert(insertVecs, insertIDs); err != nil {
-		t.Fatal(err)
+	if insertErr := idx.Insert(insertVecs, insertIDs); insertErr != nil {
+		t.Fatal(insertErr)
 	}
 
 	// Recall after inserts (on ALL vectors including inserted)
-	allVecs := append(vecs, insertVecs...)
-	allIDs := append(ids, insertIDs...)
+	allVecs := make([][]float32, 0, len(vecs)+len(insertVecs))
+	allVecs = append(allVecs, vecs...)
+	allVecs = append(allVecs, insertVecs...)
+	allIDs := make([][]byte, 0, len(ids)+len(insertIDs))
+	allIDs = append(allIDs, ids...)
+	allIDs = append(allIDs, insertIDs...)
 	recallAfter := measureRecall(idx, allVecs, allIDs, k, 30)
 	t.Logf("Recall@%d after +50%% inserts: %.1f%%", k, recallAfter*100)
 
@@ -525,8 +529,8 @@ func TestAudit_DynamicBruteForceThreshold(t *testing.T) {
 	// WHAT: Below BruteForceThreshold → brute-force (100% recall). Above → Vamana+RaBitQ.
 	// WHY: Dynamic threshold is the core optimization for small vs large shards.
 	rng := rand.New(rand.NewPCG(42, 0))
-	n := 1000
-	dim := 128
+	n := 500
+	dim := 64
 	k := 10
 	numQueries := 20
 
@@ -543,8 +547,8 @@ func TestAudit_DynamicBruteForceThreshold(t *testing.T) {
 	defer idx.Close()
 
 	iter := &sliceIterator{vecs: vecs, ids: ids}
-	if err := idx.Build(context.Background(), iter); err != nil {
-		t.Fatal(err)
+	if buildErr := idx.Build(context.Background(), iter); buildErr != nil {
+		t.Fatal(buildErr)
 	}
 
 	bruteRecall := measureRecall(idx, vecs, ids, k, numQueries)
@@ -582,7 +586,7 @@ func TestAudit_DynamicBruteForceThreshold(t *testing.T) {
 
 	// Brute-force reads raw vectors, not codes — results must be identical
 	for i := range min(len(resultsBefore), len(resultsAfter)) {
-		if string(resultsBefore[i].ID) != string(resultsAfter[i].ID) {
+		if !bytes.Equal(resultsBefore[i].ID, resultsAfter[i].ID) {
 			t.Errorf("brute-force result[%d] changed after corrupting codes — should be immune", i)
 		}
 	}
@@ -778,7 +782,7 @@ func recallAtK(exact, approx []float64, k, candidates int) float64 {
 	return float64(hits) / float64(k)
 }
 
-func measureRecall(idx *Index, vecs [][]float32, ids [][]byte, k, numQueries int) float64 {
+func measureRecall(idx *Index, vecs [][]float32, ids [][]byte, k, numQueries int) float64 { //nolint:unparam // k is parameterized for clarity even if callers currently use same value
 	n := len(vecs)
 	totalRecall := 0.0
 

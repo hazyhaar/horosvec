@@ -280,7 +280,7 @@ func (idx *Index) Search(query []float32, topK int) ([]Result, error) {
 		return idx.bruteForceSearch(query, topK)
 	}
 
-	return idx.vamanaSearch(query, topK)
+	return idx.vamanaSearch(query, topK), nil
 }
 
 // bruteForceSearch scans all vectors with exact L2. 100% recall, O(N).
@@ -354,7 +354,7 @@ func (idx *Index) bruteForceSQLite(query []float32, topK int) ([]Result, error) 
 }
 
 // vamanaSearch does 2-stage RaBitQ beam search + L2 rerank.
-func (idx *Index) vamanaSearch(query []float32, topK int) ([]Result, error) {
+func (idx *Index) vamanaSearch(query []float32, topK int) []Result {
 	// Determine beam width: wide enough for re-ranking
 	rerankN := idx.cfg.RerankTopN
 	if rerankN < topK*3 {
@@ -398,7 +398,7 @@ func (idx *Index) vamanaSearch(query []float32, topK int) ([]Result, error) {
 		results = append(results, Result{ID: idCopy, Score: c.dist})
 	}
 
-	return results, nil
+	return results
 }
 
 // sortResults sorts results by score (ascending).
@@ -419,8 +419,8 @@ func sortResults(results []Result) {
 // The query is centered once and reused for all distance computations.
 // Uses pooled searchState for zero-alloc steady state (bitset visited,
 // typed heap without interface boxing, pre-allocated best list).
-func (idx *Index) rabitqGreedySearch(query []float32, L int) []searchCandidate {
-	state := acquireSearchState(idx.nextID, L, idx.dim)
+func (idx *Index) rabitqGreedySearch(query []float32, beamWidth int) []searchCandidate {
+	state := acquireSearchState(idx.nextID, beamWidth, idx.dim)
 	defer releaseSearchState(state)
 
 	// Pre-compute query centering and squared norm (into pooled buffer)
@@ -440,13 +440,13 @@ func (idx *Index) rabitqGreedySearch(query []float32, L int) []searchCandidate {
 	startDist := rabitqDistanceAsymPrecomp(state.queryCentered, querySqNorm, medoidNode.code, medoidNode.sqNorm, medoidNode.l1Norm)
 
 	state.pushHeap(searchCandidate{nodeID: idx.medoid, dist: startDist})
-	state.insertBest(searchCandidate{nodeID: idx.medoid, dist: startDist}, L)
+	state.insertBest(searchCandidate{nodeID: idx.medoid, dist: startDist}, beamWidth)
 	worstBest := startDist
 
 	for state.heapLen > 0 {
 		cur := state.popHeap()
 
-		if len(state.best) >= L && cur.dist > worstBest {
+		if len(state.best) >= beamWidth && cur.dist > worstBest {
 			break
 		}
 
@@ -467,9 +467,9 @@ func (idx *Index) rabitqGreedySearch(query []float32, L int) []searchCandidate {
 
 			d := rabitqDistanceAsymPrecomp(state.queryCentered, querySqNorm, nbrNode.code, nbrNode.sqNorm, nbrNode.l1Norm)
 
-			if len(state.best) < L || d < worstBest {
+			if len(state.best) < beamWidth || d < worstBest {
 				state.pushHeap(searchCandidate{nodeID: nbr, dist: d})
-				state.insertBest(searchCandidate{nodeID: nbr, dist: d}, L)
+				state.insertBest(searchCandidate{nodeID: nbr, dist: d}, beamWidth)
 				worstBest = state.worstBestDist()
 			}
 		}

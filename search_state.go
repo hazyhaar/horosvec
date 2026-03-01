@@ -31,9 +31,9 @@ var searchPool = sync.Pool{
 }
 
 // acquireSearchState gets a searchState from the pool and resets it for the given parameters.
-func acquireSearchState(maxNodes int64, L int, dim int) *searchState {
+func acquireSearchState(maxNodes int64, beamWidth int, dim int) *searchState {
 	s := searchPool.Get().(*searchState)
-	s.reset(maxNodes, L, dim)
+	s.reset(maxNodes, beamWidth, dim)
 	return s
 }
 
@@ -43,7 +43,7 @@ func releaseSearchState(s *searchState) {
 }
 
 // reset prepares the searchState for a new query.
-func (s *searchState) reset(maxNodes int64, L int, dim int) {
+func (s *searchState) reset(maxNodes int64, beamWidth int, dim int) {
 	// Ensure bitset capacity
 	needed := int((maxNodes + 63) / 64)
 	if len(s.visited) < needed {
@@ -54,16 +54,16 @@ func (s *searchState) reset(maxNodes int64, L int, dim int) {
 	s.capacity = maxNodes
 
 	// Reset heap
-	if cap(s.heap) < L*2 {
-		s.heap = make([]searchCandidate, 0, L*2)
+	if cap(s.heap) < beamWidth*2 {
+		s.heap = make([]searchCandidate, 0, beamWidth*2)
 	} else {
 		s.heap = s.heap[:0]
 	}
 	s.heapLen = 0
 
 	// Reset best list
-	if cap(s.best) < L+1 {
-		s.best = make([]searchCandidate, 0, L+1)
+	if cap(s.best) < beamWidth+1 {
+		s.best = make([]searchCandidate, 0, beamWidth+1)
 	} else {
 		s.best = s.best[:0]
 	}
@@ -139,8 +139,8 @@ func (s *searchState) siftDown(i int) {
 
 // --- sorted best list ---
 
-// insertBest inserts a candidate into the sorted best list, maintaining at most L entries.
-func (s *searchState) insertBest(c searchCandidate, L int) {
+// insertBest inserts a candidate into the sorted best list, maintaining at most beamWidth entries.
+func (s *searchState) insertBest(c searchCandidate, beamWidth int) {
 	// Binary search for insertion point
 	lo, hi := 0, len(s.best)
 	for lo < hi {
@@ -155,8 +155,8 @@ func (s *searchState) insertBest(c searchCandidate, L int) {
 	s.best = append(s.best, searchCandidate{})
 	copy(s.best[lo+1:], s.best[lo:])
 	s.best[lo] = c
-	if len(s.best) > L {
-		s.best = s.best[:L]
+	if len(s.best) > beamWidth {
+		s.best = s.best[:beamWidth]
 	}
 }
 

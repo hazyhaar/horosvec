@@ -102,7 +102,7 @@ func findMedoid(nodes []graphNode) int64 {
 func greedySearch(
 	query []float32,
 	start int64,
-	L int,
+	beamWidth int,
 	getVec func(int64) []float32,
 	getNeighbors func(int64) []int64,
 ) (candidates []searchCandidate, visited map[int64]bool) {
@@ -120,8 +120,8 @@ func greedySearch(
 	h := &candidateHeap{{nodeID: start, dist: startDist}}
 	heap.Init(h)
 
-	// best holds the top-L results (sorted by distance)
-	best := make([]searchCandidate, 0, L+1)
+	// best holds the top-beamWidth results (sorted by distance)
+	best := make([]searchCandidate, 0, beamWidth+1)
 	best = append(best, searchCandidate{nodeID: start, dist: startDist})
 
 	worstBest := startDist
@@ -129,8 +129,8 @@ func greedySearch(
 	for h.Len() > 0 {
 		cur := heap.Pop(h).(searchCandidate)
 
-		// If this candidate is worse than our worst L-th result, we're done
-		if len(best) >= L && cur.dist > worstBest {
+		// If this candidate is worse than our worst beamWidth-th result, we're done
+		if len(best) >= beamWidth && cur.dist > worstBest {
 			break
 		}
 
@@ -148,13 +148,13 @@ func greedySearch(
 			d := l2DistanceSquared(query, nbrVec)
 
 			// Add to candidates if potentially useful
-			if len(best) < L || d < worstBest {
+			if len(best) < beamWidth || d < worstBest {
 				heap.Push(h, searchCandidate{nodeID: nbr, dist: d})
 
 				// Insert into best list maintaining sort
 				best = insertSorted(best, searchCandidate{nodeID: nbr, dist: d})
-				if len(best) > L {
-					best = best[:L]
+				if len(best) > beamWidth {
+					best = best[:beamWidth]
 				}
 				worstBest = best[len(best)-1].dist
 			}
@@ -190,7 +190,7 @@ func robustPrune(
 	nodeID int64,
 	candidates []searchCandidate,
 	alpha float64,
-	R int,
+	maxDegree int,
 	getVec func(int64) []float32,
 ) []int64 {
 	// Remove self and duplicates
@@ -207,13 +207,13 @@ func robustPrune(
 	// Sort by distance
 	sortCandidates(filtered)
 
-	result := make([]int64, 0, R)
+	result := make([]int64, 0, maxDegree)
 	nodeVec := getVec(nodeID)
 	if nodeVec == nil {
 		return result
 	}
 
-	for len(filtered) > 0 && len(result) < R {
+	for len(filtered) > 0 && len(result) < maxDegree {
 		// Pick closest candidate
 		best := filtered[0]
 		filtered = filtered[1:]
@@ -264,8 +264,8 @@ func buildGraph(
 	ctx context.Context,
 	nodes []graphNode,
 	medoid int64,
-	R int,
-	L int,
+	maxDegree int,
+	beamWidth int,
 	alpha float64,
 	passes int,
 ) {
@@ -291,7 +291,7 @@ func buildGraph(
 	rng := rand.New(rand.NewPCG(42, 0))
 
 	// Initialize with random neighbors using Fisher-Yates partial shuffle
-	nNeighbors := R
+	nNeighbors := maxDegree
 	if nNeighbors > n-1 {
 		nNeighbors = n - 1
 	}
@@ -357,7 +357,7 @@ func buildGraph(
 			node := &nodes[oi]
 
 			// Greedy search from medoid to this node's vector
-			candidates, _ := greedySearch(node.vec, medoid, L, getVec, getNeighbors)
+			candidates, _ := greedySearch(node.vec, medoid, beamWidth, getVec, getNeighbors)
 
 			// Add current neighbors to candidate set
 			for _, nbr := range node.neighbors {
@@ -369,10 +369,10 @@ func buildGraph(
 			}
 
 			// Robust prune to select new neighbors
-			newNeighbors := robustPrune(node.id, candidates, alpha, R, getVec)
+			newNeighbors := robustPrune(node.id, candidates, alpha, maxDegree, getVec)
 			node.neighbors = newNeighbors
 
-			// Add reverse edges (simplified: just append, don't prune unless over 2R)
+			// Add reverse edges (simplified: just append, don't prune unless over 2*maxDegree)
 			for _, nbr := range newNeighbors {
 				if nbr < 0 || int(nbr) >= n {
 					continue
@@ -387,8 +387,8 @@ func buildGraph(
 				}
 				if !found {
 					nbrNode.neighbors = append(nbrNode.neighbors, node.id)
-					// Only prune if well over capacity (2R threshold avoids constant re-pruning)
-					if len(nbrNode.neighbors) > 2*R {
+					// Only prune if well over capacity (2*maxDegree threshold avoids constant re-pruning)
+					if len(nbrNode.neighbors) > 2*maxDegree {
 						cands := make([]searchCandidate, len(nbrNode.neighbors))
 						for ci, nn := range nbrNode.neighbors {
 							nnVec := getVec(nn)
@@ -399,7 +399,7 @@ func buildGraph(
 								}
 							}
 						}
-						nbrNode.neighbors = robustPrune(nbr, cands, alpha, R, getVec)
+						nbrNode.neighbors = robustPrune(nbr, cands, alpha, maxDegree, getVec)
 					}
 				}
 			}
@@ -408,7 +408,7 @@ func buildGraph(
 
 	// Final pass: prune any over-capacity neighborhoods
 	for i := range nodes {
-		if len(nodes[i].neighbors) > R {
+		if len(nodes[i].neighbors) > maxDegree {
 			node := &nodes[i]
 			cands := make([]searchCandidate, len(node.neighbors))
 			for ci, nn := range node.neighbors {
@@ -420,7 +420,7 @@ func buildGraph(
 					}
 				}
 			}
-			node.neighbors = robustPrune(node.id, cands, alpha, R, getVec)
+			node.neighbors = robustPrune(node.id, cands, alpha, maxDegree, getVec)
 		}
 	}
 }
