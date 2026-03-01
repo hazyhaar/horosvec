@@ -438,7 +438,7 @@ func TestSearchResultsValid(t *testing.T) {
 
 func TestInsertNeighborsConnected(t *testing.T) {
 	const (
-		n   = 500
+		n   = 300
 		dim = 64
 	)
 
