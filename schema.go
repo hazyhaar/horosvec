@@ -1,84 +1,59 @@
-// CLAUDE:SUMMARY SQLite schema DDL, node persistence, metadata storage, index swap, and cache warming.
+// CLAUDE:SUMMARY SQLite schema DDL, node persistence, metadata storage, and cache warming.
 package horosvec
 
 import (
 	"database/sql"
 	"fmt"
-	"strconv"
 	"time"
 )
 
 const schemaSQL = `
-CREATE TABLE IF NOT EXISTS vec_nodes (
+CREATE TABLE IF NOT EXISTS vindex_nodes (
     node_id   INTEGER PRIMARY KEY,
     ext_id    BLOB NOT NULL UNIQUE,
     neighbors BLOB NOT NULL,
+    quantized BLOB NOT NULL,
     vector    BLOB NOT NULL,
-    rabitq    BLOB NOT NULL,
     sq_norm   REAL NOT NULL,
     l1_norm   REAL NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_vec_nodes_ext ON vec_nodes(ext_id);
+CREATE INDEX IF NOT EXISTS idx_vindex_ext ON vindex_nodes(ext_id);
 
-CREATE TABLE IF NOT EXISTS vec_meta (
+CREATE TABLE IF NOT EXISTS vindex_meta (
     key   TEXT PRIMARY KEY,
     value BLOB NOT NULL
 );
 `
 
-const schemaSQLNew = `
-CREATE TABLE IF NOT EXISTS vec_nodes_new (
-    node_id   INTEGER PRIMARY KEY,
-    ext_id    BLOB NOT NULL UNIQUE,
-    neighbors BLOB NOT NULL,
-    vector    BLOB NOT NULL,
-    rabitq    BLOB NOT NULL,
-    sq_norm   REAL NOT NULL,
-    l1_norm   REAL NOT NULL DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS idx_vec_nodes_new_ext ON vec_nodes_new(ext_id);
-
-CREATE TABLE IF NOT EXISTS vec_meta_new (
-    key   TEXT PRIMARY KEY,
-    value BLOB NOT NULL
-);
-`
-
-// initSchema creates the vec_nodes and vec_meta tables if they don't exist.
+// initSchema creates the vindex_nodes and vindex_meta tables if they don't exist.
 func initSchema(db *sql.DB) error {
 	_, err := db.Exec(schemaSQL)
 	return err
 }
 
-// initSchemaNew creates the staging tables for async rebuild.
-func initSchemaNew(db *sql.DB) error {
-	_, err := db.Exec(schemaSQLNew)
-	return err
-}
-
 // saveNode persists a single node to the database.
-func saveNode(tx *sql.Tx, table string, nodeID int32, extID []byte, neighbors []int32, vec []float32, code []byte, sqNorm float64, l1Norm float64) error {
-	neighborsBlob := serializeInt32s(neighbors)
+func saveNode(tx *sql.Tx, nodeID int64, extID []byte, neighbors []int64, vec []float32, code []byte, sqNorm float64, l1Norm float64) error {
+	neighborsBlob := serializeInt64s(neighbors)
 	vectorBlob := serializeFloat32s(vec)
 	_, err := tx.Exec(
-		fmt.Sprintf("INSERT OR REPLACE INTO %s (node_id, ext_id, neighbors, vector, rabitq, sq_norm, l1_norm) VALUES (?, ?, ?, ?, ?, ?, ?)", table),
+		"INSERT OR REPLACE INTO vindex_nodes (node_id, ext_id, neighbors, vector, quantized, sq_norm, l1_norm) VALUES (?, ?, ?, ?, ?, ?, ?)",
 		nodeID, extID, neighborsBlob, vectorBlob, code, sqNorm, l1Norm,
 	)
 	return err
 }
 
 // updateNeighbors updates just the neighbors of an existing node.
-func updateNeighbors(tx *sql.Tx, table string, nodeID int32, neighbors []int32) error {
-	neighborsBlob := serializeInt32s(neighbors)
+func updateNeighbors(tx *sql.Tx, nodeID int64, neighbors []int64) error {
+	neighborsBlob := serializeInt64s(neighbors)
 	_, err := tx.Exec(
-		fmt.Sprintf("UPDATE %s SET neighbors = ? WHERE node_id = ?", table),
+		"UPDATE vindex_nodes SET neighbors = ? WHERE node_id = ?",
 		neighborsBlob, nodeID,
 	)
 	return err
 }
 
 // loadNode loads a single node from the database, checking the cache first.
-func loadNode(db *sql.DB, cache *nodeCache, nodeID int32) (*cachedNode, error) {
+func loadNode(db *sql.DB, cache *nodeCache, nodeID int64) (*cachedNode, error) {
 	if cached := cache.get(nodeID); cached != nil {
 		return cached, nil
 	}
@@ -86,7 +61,7 @@ func loadNode(db *sql.DB, cache *nodeCache, nodeID int32) (*cachedNode, error) {
 	var neighbors, vectorBlob, code []byte
 	var sqNorm, l1Norm float64
 	err := db.QueryRow(
-		"SELECT neighbors, vector, rabitq, sq_norm, l1_norm FROM vec_nodes WHERE node_id = ?",
+		"SELECT neighbors, vector, quantized, sq_norm, l1_norm FROM vindex_nodes WHERE node_id = ?",
 		nodeID,
 	).Scan(&neighbors, &vectorBlob, &code, &sqNorm, &l1Norm)
 	if err != nil {
@@ -95,7 +70,7 @@ func loadNode(db *sql.DB, cache *nodeCache, nodeID int32) (*cachedNode, error) {
 
 	node := &cachedNode{
 		nodeID:    nodeID,
-		neighbors: deserializeInt32s(neighbors),
+		neighbors: deserializeInt64s(neighbors),
 		vec:       deserializeFloat32s(vectorBlob),
 		code:      code,
 		sqNorm:    sqNorm,
@@ -106,20 +81,15 @@ func loadNode(db *sql.DB, cache *nodeCache, nodeID int32) (*cachedNode, error) {
 }
 
 // saveGraph persists all nodes and metadata from a build.
-func saveGraph(tx *sql.Tx, table string, nodes []graphNode, medoid int32, dim int, maxDegree int, centroid []float32) error {
+func saveGraph(tx *sql.Tx, nodes []graphNode, medoid int64, dim int, maxDegree int, centroid []float32) error {
 	for _, n := range nodes {
-		if err := saveNode(tx, table, n.id, n.extID, n.neighbors, n.vec, n.code, n.sqNorm, n.l1Norm); err != nil {
+		if err := saveNode(tx, n.id, n.extID, n.neighbors, n.vec, n.code, n.sqNorm, n.l1Norm); err != nil {
 			return fmt.Errorf("save node %d: %w", n.id, err)
 		}
 	}
 
-	metaTable := "vec_meta"
-	if table == "vec_nodes_new" {
-		metaTable = "vec_meta_new"
-	}
-
 	metas := map[string][]byte{
-		"medoid":           serializeInt64(int64(medoid)),
+		"medoid":           serializeInt64(medoid),
 		"dimension":        serializeInt64(int64(dim)),
 		"max_degree":       serializeInt64(int64(maxDegree)),
 		"node_count":       serializeInt64(int64(len(nodes))),
@@ -129,7 +99,7 @@ func saveGraph(tx *sql.Tx, table string, nodes []graphNode, medoid int32, dim in
 	}
 	for k, v := range metas {
 		_, err := tx.Exec(
-			fmt.Sprintf("INSERT OR REPLACE INTO %s (key, value) VALUES (?, ?)", metaTable),
+			"INSERT OR REPLACE INTO vindex_meta (key, value) VALUES (?, ?)",
 			k, v,
 		)
 		if err != nil {
@@ -143,7 +113,7 @@ func saveGraph(tx *sql.Tx, table string, nodes []graphNode, medoid int32, dim in
 // loadMeta reads a metadata value by key.
 func loadMeta(db *sql.DB, key string) ([]byte, error) {
 	var val []byte
-	err := db.QueryRow("SELECT value FROM vec_meta WHERE key = ?", key).Scan(&val)
+	err := db.QueryRow("SELECT value FROM vindex_meta WHERE key = ?", key).Scan(&val)
 	if err != nil {
 		return nil, err
 	}
@@ -151,9 +121,9 @@ func loadMeta(db *sql.DB, key string) ([]byte, error) {
 }
 
 // loadIndex loads an existing index from the database.
-func loadIndex(db *sql.DB) (medoid int32, dim int, nodeCount int, centroid []float32, vectorsAtBuild int64, err error) {
+func loadIndex(db *sql.DB) (medoid int64, dim int, nodeCount int, centroid []float32, vectorsAtBuild int64, err error) {
 	var name string
-	err = db.QueryRow("SELECT name FROM sqlite_master WHERE type='table' AND name='vec_meta'").Scan(&name)
+	err = db.QueryRow("SELECT name FROM sqlite_master WHERE type='table' AND name='vindex_meta'").Scan(&name)
 	if err != nil {
 		return 0, 0, 0, nil, 0, fmt.Errorf("no index found: %w", err)
 	}
@@ -162,7 +132,7 @@ func loadIndex(db *sql.DB) (medoid int32, dim int, nodeCount int, centroid []flo
 	if err != nil {
 		return 0, 0, 0, nil, 0, fmt.Errorf("load medoid: %w", err)
 	}
-	medoid = int32(deserializeInt64(medoidBytes))
+	medoid = deserializeInt64(medoidBytes)
 
 	dimBytes, err := loadMeta(db, "dimension")
 	if err != nil {
@@ -193,83 +163,41 @@ func loadIndex(db *sql.DB) (medoid int32, dim int, nodeCount int, centroid []flo
 }
 
 // getMaxNodeID returns the current maximum node_id in the table.
-func getMaxNodeID(db *sql.DB) (int32, error) {
+func getMaxNodeID(db *sql.DB) (int64, error) {
 	var maxID sql.NullInt64
-	err := db.QueryRow("SELECT MAX(node_id) FROM vec_nodes").Scan(&maxID)
+	err := db.QueryRow("SELECT MAX(node_id) FROM vindex_nodes").Scan(&maxID)
 	if err != nil {
 		return 0, err
 	}
 	if !maxID.Valid {
 		return -1, nil
 	}
-	return int32(maxID.Int64), nil
+	return maxID.Int64, nil
 }
 
-// getNodeCount returns the number of nodes in vec_nodes.
+// getNodeCount returns the number of nodes in vindex_nodes.
 func getNodeCount(db *sql.DB) (int, error) {
 	var count int
-	err := db.QueryRow("SELECT COUNT(*) FROM vec_nodes").Scan(&count)
+	err := db.QueryRow("SELECT COUNT(*) FROM vindex_nodes").Scan(&count)
 	return count, err
 }
 
-// swapIndex atomically replaces vec_nodes/vec_meta with vec_nodes_new/vec_meta_new.
-func swapIndex(db *sql.DB) error {
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	statements := []string{
-		"DROP TABLE IF EXISTS vec_nodes_old",
-		"DROP TABLE IF EXISTS vec_meta_old",
-		"ALTER TABLE vec_nodes RENAME TO vec_nodes_old",
-		"ALTER TABLE vec_meta RENAME TO vec_meta_old",
-		"ALTER TABLE vec_nodes_new RENAME TO vec_nodes",
-		"ALTER TABLE vec_meta_new RENAME TO vec_meta",
-		"DROP TABLE IF EXISTS vec_nodes_old",
-		"DROP TABLE IF EXISTS vec_meta_old",
-	}
-
-	for _, stmt := range statements {
-		if _, err := tx.Exec(stmt); err != nil {
-			return fmt.Errorf("swap: %s: %w", stmt, err)
-		}
-	}
-
-	_, err = tx.Exec("CREATE INDEX IF NOT EXISTS idx_vec_nodes_ext ON vec_nodes(ext_id)")
-	if err != nil {
-		return fmt.Errorf("recreate index: %w", err)
-	}
-
-	return tx.Commit()
-}
-
-// updateNodeCount updates the node_count in vec_meta.
-func updateNodeCount(db *sql.DB, count int) error {
-	_, err := db.Exec(
-		"INSERT OR REPLACE INTO vec_meta (key, value) VALUES (?, ?)",
-		"node_count", []byte(strconv.Itoa(count)),
-	)
-	return err
-}
-
-// updateNodeCountInt64 updates the node_count in vec_meta using int64 serialization.
+// updateNodeCountInt64 updates the node_count in vindex_meta using int64 serialization.
 func updateNodeCountInt64(db *sql.DB, count int64) error {
 	_, err := db.Exec(
-		"INSERT OR REPLACE INTO vec_meta (key, value) VALUES (?, ?)",
+		"INSERT OR REPLACE INTO vindex_meta (key, value) VALUES (?, ?)",
 		"node_count", serializeInt64(count),
 	)
 	return err
 }
 
 // warmCache pre-loads the medoid and its neighbors up to depth hops.
-func warmCache(db *sql.DB, cache *nodeCache, medoid int32, depth int) {
-	queue := []int32{medoid}
-	seen := map[int32]bool{medoid: true}
+func warmCache(db *sql.DB, cache *nodeCache, medoid int64, depth int) {
+	queue := []int64{medoid}
+	seen := map[int64]bool{medoid: true}
 
 	for d := 0; d <= depth && len(queue) > 0; d++ {
-		var next []int32
+		var next []int64
 		for _, nodeID := range queue {
 			node, err := loadNode(db, cache, nodeID)
 			if err != nil {

@@ -5,8 +5,8 @@ import "sync"
 
 // cachedNode holds graph node data in the LRU cache.
 type cachedNode struct {
-	nodeID    int32
-	neighbors []int32
+	nodeID    int64
+	neighbors []int64
 	vec       []float32 // raw vector for exact L2 during search
 	code      []byte    // RaBitQ 1-bit code
 	sqNorm    float64
@@ -20,7 +20,7 @@ type cachedNode struct {
 type nodeCache struct {
 	mu       sync.RWMutex
 	capacity int
-	items    map[int32]*cachedNode
+	items    map[int64]*cachedNode
 
 	// doubly-linked list: head = most recently used, tail = least recently used
 	head, tail *cachedNode
@@ -30,12 +30,12 @@ type nodeCache struct {
 func newNodeCache(capacity int) *nodeCache {
 	return &nodeCache{
 		capacity: capacity,
-		items:    make(map[int32]*cachedNode, capacity),
+		items:    make(map[int64]*cachedNode, capacity),
 	}
 }
 
 // get retrieves a node from the cache. Returns nil if not found.
-func (c *nodeCache) get(nodeID int32) *cachedNode {
+func (c *nodeCache) get(nodeID int64) *cachedNode {
 	c.mu.RLock()
 	node, ok := c.items[nodeID]
 	c.mu.RUnlock()
@@ -79,7 +79,7 @@ func (c *nodeCache) put(node *cachedNode) {
 func (c *nodeCache) clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.items = make(map[int32]*cachedNode, c.capacity)
+	c.items = make(map[int64]*cachedNode, c.capacity)
 	c.head = nil
 	c.tail = nil
 }

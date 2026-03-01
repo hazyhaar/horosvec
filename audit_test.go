@@ -231,15 +231,15 @@ func TestAudit_Vamana_GraphConnectivity(t *testing.T) {
 			enc := NewEncoder(centroid)
 			for i, v := range vecs {
 				code, sqNorm, l1Norm := enc.Encode(v)
-				nodes[i] = graphNode{id: int32(i), vec: v, code: code, sqNorm: sqNorm, l1Norm: l1Norm}
+				nodes[i] = graphNode{id: int64(i), vec: v, code: code, sqNorm: sqNorm, l1Norm: l1Norm}
 			}
 
 			medoid := findMedoid(nodes)
 			buildGraph(context.Background(), nodes, medoid, 64, 128, 1.2, 2)
 
 			// BFS from medoid
-			visited := make(map[int32]bool)
-			queue := []int32{medoid}
+			visited := make(map[int64]bool)
+			queue := []int64{medoid}
 			visited[medoid] = true
 			for len(queue) > 0 {
 				cur := queue[0]
@@ -276,7 +276,7 @@ func TestAudit_Vamana_DegreeDistribution(t *testing.T) {
 	enc := NewEncoder(centroid)
 	for i, v := range vecs {
 		code, sqNorm, l1Norm := enc.Encode(v)
-		nodes[i] = graphNode{id: int32(i), vec: v, code: code, sqNorm: sqNorm, l1Norm: l1Norm}
+		nodes[i] = graphNode{id: int64(i), vec: v, code: code, sqNorm: sqNorm, l1Norm: l1Norm}
 	}
 
 	medoid := findMedoid(nodes)
@@ -437,7 +437,7 @@ func TestAudit_Vamana_RaBitQUsed(t *testing.T) {
 	}
 
 	// Corrupt ALL RaBitQ codes in the database
-	_, err = db.Exec("UPDATE vec_nodes SET rabitq = zeroblob(128), sq_norm = 0, l1_norm = 0")
+	_, err = db.Exec("UPDATE vindex_nodes SET quantized = zeroblob(128), sq_norm = 0, l1_norm = 0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -569,7 +569,7 @@ func TestAudit_DynamicBruteForceThreshold(t *testing.T) {
 	}
 
 	// Corrupt all codes
-	_, err = db.Exec("UPDATE vec_nodes SET rabitq = zeroblob(128), sq_norm = 0, l1_norm = 0")
+	_, err = db.Exec("UPDATE vindex_nodes SET quantized = zeroblob(128), sq_norm = 0, l1_norm = 0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -691,7 +691,6 @@ func newTestDB2(tb testing.TB) *sql.DB {
 	if err != nil {
 		tb.Fatal(err)
 	}
-	db.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL")
 	tb.Cleanup(func() { db.Close() })
 	return db
 }

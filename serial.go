@@ -56,6 +56,25 @@ func deserializeFloat64(buf []byte) float64 {
 	return math.Float64frombits(binary.LittleEndian.Uint64(buf))
 }
 
+// serializeInt64s encodes a slice of int64 values into a byte slice (little-endian).
+func serializeInt64s(vals []int64) []byte {
+	buf := make([]byte, len(vals)*8)
+	for i, v := range vals {
+		binary.LittleEndian.PutUint64(buf[i*8:], uint64(v))
+	}
+	return buf
+}
+
+// deserializeInt64s decodes a byte slice into a slice of int64 values (little-endian).
+func deserializeInt64s(buf []byte) []int64 {
+	n := len(buf) / 8
+	vals := make([]int64, n)
+	for i := range n {
+		vals[i] = int64(binary.LittleEndian.Uint64(buf[i*8:]))
+	}
+	return vals
+}
+
 // serializeInt64(v) encodes an int64 into 8 bytes (little-endian).
 func serializeInt64(v int64) []byte {
 	buf := make([]byte, 8)
