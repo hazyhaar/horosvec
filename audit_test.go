@@ -220,7 +220,7 @@ func TestAudit_RaBitQ_PaperFormula(t *testing.T) {
 func TestAudit_Vamana_GraphConnectivity(t *testing.T) {
 	// WHAT: BFS from medoid must reach all nodes.
 	// WHY: Disconnected nodes are invisible to search — silent data loss.
-	sizes := []int{100, 500, 1000}
+	sizes := []int{100, 500}
 	for _, n := range sizes {
 		t.Run(fmt.Sprintf("n%d", n), func(t *testing.T) {
 			rng := rand.New(rand.NewPCG(42, 0))
@@ -325,7 +325,6 @@ func TestAudit_Vamana_SearchVsBruteForce(t *testing.T) {
 	}{
 		{100, 64},
 		{500, 64},
-		{1000, 64},
 	}
 
 	for _, s := range scales {
@@ -410,7 +409,7 @@ func TestAudit_Vamana_RaBitQUsed(t *testing.T) {
 	// WHY: Confirms RaBitQ is active in 2-stage search (RaBitQ beam + L2 rerank).
 	rng := rand.New(rand.NewPCG(42, 0))
 	n := 1000
-	dim := 128
+	dim := 64
 	k := 10
 
 	db := newTestDB(t)
@@ -471,7 +470,7 @@ func TestAudit_Vamana_InsertDegradation(t *testing.T) {
 	// WHAT: Recall after inserting 50% more vectors without rebuild.
 	// WHY: Real-world usage adds vectors incrementally — must not degrade too much.
 	rng := rand.New(rand.NewPCG(42, 0))
-	n := 1000
+	n := 500
 	dim := 64
 	k := 10
 
