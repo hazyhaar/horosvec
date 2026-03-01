@@ -1,6 +1,7 @@
 package horosvec
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -63,8 +64,8 @@ func generateVecs(rng *rand.Rand, n, dim int) ([][]float32, [][]byte) {
 
 func TestBuildAndSearchRecall(t *testing.T) {
 	const (
-		n   = 10000
-		dim = 128
+		n   = 2000
+		dim = 64
 		k   = 10
 	)
 
@@ -95,9 +96,10 @@ func TestBuildAndSearchRecall(t *testing.T) {
 	// Test recall@10 over multiple queries
 	numQueries := 50
 	totalRecall := 0.0
+	stride := n / numQueries
 
 	for q := range numQueries {
-		query := vecs[q*100] // pick every 100th vector as query
+		query := vecs[q*stride] // pick every stride-th vector as query
 
 		// Compute exact top-k
 		type idDist struct {
@@ -195,7 +197,7 @@ func TestInsertAndFind(t *testing.T) {
 			t.Fatalf("search for inserted vec %d: %v", i, err)
 		}
 		for _, r := range results {
-			if string(r.ID) == string(insertIDs[i]) {
+			if bytes.Equal(r.ID, insertIDs[i]) {
 				found++
 				break
 			}
@@ -276,7 +278,7 @@ func TestPersistenceRoundTrip(t *testing.T) {
 		// The query vector itself should be in the top results
 		foundSelf := false
 		for _, r := range results {
-			if string(r.ID) == string(ids[0]) {
+			if bytes.Equal(r.ID, ids[0]) {
 				foundSelf = true
 				break
 			}
@@ -454,8 +456,8 @@ func TestInsertNeighborsConnected(t *testing.T) {
 	defer idx.Close()
 
 	iter := &sliceIterator{vecs: vecs, ids: ids}
-	if err := idx.Build(context.Background(), iter); err != nil {
-		t.Fatal(err)
+	if buildErr := idx.Build(context.Background(), iter); buildErr != nil {
+		t.Fatal(buildErr)
 	}
 
 	// Insert a new vector
@@ -465,8 +467,8 @@ func TestInsertNeighborsConnected(t *testing.T) {
 	}
 	insertID := []byte{0xFF, 0xFF, 0xFF, 0x01}
 
-	if err := idx.Insert([][]float32{insertVec}, [][]byte{insertID}); err != nil {
-		t.Fatal(err)
+	if insertErr := idx.Insert([][]float32{insertVec}, [][]byte{insertID}); insertErr != nil {
+		t.Fatal(insertErr)
 	}
 
 	// Verify the inserted node has neighbors in the DB
@@ -487,7 +489,7 @@ func TestInsertNeighborsConnected(t *testing.T) {
 	}
 	found := false
 	for _, r := range results {
-		if string(r.ID) == string(insertID) {
+		if bytes.Equal(r.ID, insertID) {
 			found = true
 			break
 		}

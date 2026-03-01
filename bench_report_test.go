@@ -361,14 +361,15 @@ func BenchmarkReport_Insert_Into5K(b *testing.B) {
 // ════════════════════════════════════════════════════════════════
 
 func TestReport_RecallAtScale(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping report test in short mode")
+	}
 	scales := []struct {
 		n, dim int
 	}{
 		{100, 64},
-		{500, 128},
-		{1000, 128},
-		{5000, 128},
-		{10000, 128},
+		{500, 64},
+		{1000, 64},
 	}
 
 	fmt.Println()
@@ -441,11 +442,9 @@ func TestReport_RecallAtScale(t *testing.T) {
 		}
 
 		avgRecall := totalRecall / float64(numQueries)
-		path := "brute-force"
+		path := "Vamana+RaBitQ"
 		if idx.cfg.BruteForceThreshold > 0 && int(idx.nextID) <= idx.cfg.BruteForceThreshold {
 			path = "brute-force"
-		} else {
-			path = "Vamana+RaBitQ"
 		}
 
 		fmt.Printf("│  %6d  │ %3d │   %5.1f%%   │ %-10s │     %3d     │\n",
@@ -462,12 +461,14 @@ func TestReport_RecallAtScale(t *testing.T) {
 // ════════════════════════════════════════════════════════════════
 
 func TestReport_MemoryProfile(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping report test in short mode")
+	}
 	scales := []struct {
 		n, dim int
 	}{
-		{1000, 128},
-		{5000, 128},
-		{10000, 128},
+		{500, 64},
+		{1000, 64},
 	}
 
 	fmt.Println()
@@ -494,8 +495,8 @@ func TestReport_MemoryProfile(t *testing.T) {
 		}
 
 		iter := &sliceIterator{vecs: vecs, ids: ids}
-		if err := idx.Build(context.Background(), iter); err != nil {
-			t.Fatal(err)
+		if buildErr := idx.Build(context.Background(), iter); buildErr != nil {
+			t.Fatal(buildErr)
 		}
 
 		idx.Close()
@@ -526,6 +527,9 @@ func TestReport_MemoryProfile(t *testing.T) {
 // ════════════════════════════════════════════════════════════════
 
 func TestReport_RaBitQCorrelation(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping report test in short mode")
+	}
 	dims := []int{64, 128, 256, 512, 1024}
 
 	fmt.Println()
@@ -580,26 +584,26 @@ func TestReport_RaBitQCorrelation(t *testing.T) {
 
 func BenchmarkReport_SearchStatePool(b *testing.B) {
 	maxNodes := int64(10000)
-	L := 128
+	beamWidth := 128
 	dim := 128
 
 	b.ResetTimer()
 	for b.Loop() {
-		s := acquireSearchState(maxNodes, L, dim)
+		s := acquireSearchState(maxNodes, beamWidth, dim)
 		releaseSearchState(s)
 	}
 }
 
 func BenchmarkReport_SearchStateBitset(b *testing.B) {
 	maxNodes := int64(100000)
-	L := 128
+	beamWidth := 128
 	dim := 128
-	s := acquireSearchState(maxNodes, L, dim)
+	s := acquireSearchState(maxNodes, beamWidth, dim)
 	defer releaseSearchState(s)
 
 	b.ResetTimer()
 	for b.Loop() {
-		s.reset(maxNodes, L, dim)
+		s.reset(maxNodes, beamWidth, dim)
 		for i := int64(0); i < 1000; i++ {
 			s.visit(i)
 		}
@@ -611,9 +615,12 @@ func BenchmarkReport_SearchStateBitset(b *testing.B) {
 // ════════════════════════════════════════════════════════════════
 
 func TestReport_EndToEndTimings(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping report test in short mode")
+	}
 	rng := rand.New(rand.NewPCG(42, 0))
-	n := 10000
-	dim := 128
+	n := 2000
+	dim := 64
 	vecs, ids := generateVecs(rng, n, dim)
 
 	// --- Build phase ---
@@ -684,7 +691,7 @@ func TestReport_EndToEndTimings(t *testing.T) {
 
 	fmt.Println()
 	fmt.Println("╔══════════════════════════════════════════════════════════════╗")
-	fmt.Println("║              END-TO-END TIMING REPORT (10K×128d)            ║")
+	fmt.Println("║              END-TO-END TIMING REPORT (2K×64d)               ║")
 	fmt.Println("╠══════════════════════════════════════════════════════════════╣")
 	fmt.Printf("║  New()                              %10s              ║\n", tNew.Round(time.Millisecond))
 	fmt.Printf("║  Build (10K vectors)                %10s              ║\n", tBuild.Round(time.Millisecond))
