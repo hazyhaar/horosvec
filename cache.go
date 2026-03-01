@@ -84,13 +84,6 @@ func (c *nodeCache) clear() {
 	c.tail = nil
 }
 
-// size returns the number of cached nodes.
-func (c *nodeCache) size() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return len(c.items)
-}
-
 // --- internal linked list operations (must hold mu) ---
 
 func (c *nodeCache) addToHead(node *cachedNode) {

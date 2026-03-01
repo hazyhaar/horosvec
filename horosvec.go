@@ -181,7 +181,7 @@ func (idx *Index) Build(ctx context.Context, iter VectorIterator) error {
 	if err != nil {
 		return fmt.Errorf("horosvec: begin tx: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	if _, err := tx.Exec("DELETE FROM vindex_nodes"); err != nil {
 		return fmt.Errorf("horosvec: clear nodes: %w", err)
@@ -309,14 +309,14 @@ func (idx *Index) vamanaSearch(query []float32, topK int) ([]Result, error) {
 		candidates = candidates[:topK]
 	}
 
-	results := make([]Result, len(candidates))
-	for i, c := range candidates {
+	results := make([]Result, 0, len(candidates))
+	for _, c := range candidates {
 		var extID []byte
 		err := idx.db.QueryRow("SELECT ext_id FROM vindex_nodes WHERE node_id = ?", c.nodeID).Scan(&extID)
 		if err != nil {
 			continue
 		}
-		results[i] = Result{ID: extID, Score: c.dist}
+		results = append(results, Result{ID: extID, Score: c.dist})
 	}
 
 	return results, nil
@@ -492,7 +492,7 @@ func (idx *Index) Insert(vecs [][]float32, ids [][]byte) error {
 	if err != nil {
 		return fmt.Errorf("horosvec: begin tx: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	for i, vec := range vecs {
 		nodeID := idx.nextID
@@ -515,13 +515,14 @@ func (idx *Index) Insert(vecs [][]float32, ids [][]byte) error {
 			return n.neighbors
 		}
 
-		setNeighbors := func(id int64, neighbors []int64) {
+		setNeighbors := func(id int64, neighbors []int64) error {
 			if err := updateNeighbors(tx, id, neighbors); err != nil {
-				return
+				return err
 			}
 			if cached := idx.cache.get(id); cached != nil {
 				cached.neighbors = neighbors
 			}
+			return nil
 		}
 
 		// Find nearest neighbors via rabitq search
@@ -534,9 +535,11 @@ func (idx *Index) Insert(vecs [][]float32, ids [][]byte) error {
 			}
 			neighbors = append(neighbors, c.nodeID)
 		}
-		setNeighbors(nodeID, neighbors)
+		if err := setNeighbors(nodeID, neighbors); err != nil {
+			return fmt.Errorf("horosvec: set neighbors for new node: %w", err)
+		}
 
-		// Add reverse edges
+		// Add reverse edges (best-effort: don't fail the whole insert)
 		for _, nbr := range neighbors {
 			nbrNeighbors := getNeighbors(nbr)
 			if nbrNeighbors == nil {
@@ -550,7 +553,7 @@ func (idx *Index) Insert(vecs [][]float32, ids [][]byte) error {
 				}
 			}
 			if !found && len(nbrNeighbors) < idx.cfg.MaxDegree {
-				setNeighbors(nbr, append(nbrNeighbors, nodeID))
+				_ = setNeighbors(nbr, append(nbrNeighbors, nodeID))
 			}
 		}
 
@@ -654,19 +657,17 @@ func (idx *Index) rebuildInternal(ctx context.Context, iter VectorIterator) {
 	if err != nil {
 		return
 	}
+	defer func() { _ = tx.Rollback() }()
 
 	// Clear and rebuild in-place
 	if _, err := tx.Exec("DELETE FROM vindex_nodes"); err != nil {
-		tx.Rollback()
 		return
 	}
 	if _, err := tx.Exec("DELETE FROM vindex_meta"); err != nil {
-		tx.Rollback()
 		return
 	}
 
 	if err := saveGraph(tx, nodes, medoid, dim, idx.cfg.MaxDegree, centroid); err != nil {
-		tx.Rollback()
 		return
 	}
 
