@@ -668,10 +668,16 @@ Stdlib packages used:
 ║  siftrag (Front Office SaaS RAG)                              ║
 ║    imports horosvec as vector search engine per shard          ║
 ║    One Index per user-tenant SQLite shard                      ║
+║    Lazy-loads Index, caches in map[dossierID]*Index            ║
 ║                                                               ║
-║  HORAG (Vectorisation Pipeline)                               ║
-║    imports horosvec for indexing embeddings                    ║
-║    buffer .md -> chunk -> embed -> horosvec.Build()            ║
+║  HORAG (Vectorisation Pipeline) — auto-index (mars 2026)      ║
+║    internal/indexmgr manages horosvec lifecycle per shard      ║
+║    3 regimes:                                                  ║
+║      < BuildThreshold (1000) : skip (brute-force suffisant)   ║
+║      >= BuildThreshold, pas d'index : Build() complet         ║
+║      Index existant : Insert() incremental + RebuildAsync()   ║
+║    Appels: New, Build, Insert, NeedsRebuild, RebuildAsync     ║
+║    build-indexes CLI reste pour rattrapage/maintenance         ║
 ╚═══════════════════════════════════════════════════════════════╝
 ```
 
