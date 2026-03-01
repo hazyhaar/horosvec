@@ -27,6 +27,7 @@ go test -race ./...
 - SQLite via `modernc.org/sqlite` uniquement
 - Seule dépendance externe : modernc.org/sqlite — tout le reste = stdlib
 - Pattern "library-first" : siftrag et HORAG importent horosvec comme une librairie
+- **HORAG auto-index** (mars 2026) : HORAG intègre un `indexmgr` qui appelle `Build()`, `Insert()`, `NeedsRebuild()`, `RebuildAsync()` automatiquement après chaque insertion dans `rag_vectors`. Le CLI `build-indexes` reste pour rattrapage/maintenance uniquement.
 
 ## Architecture
 
