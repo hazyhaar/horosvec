@@ -2,7 +2,6 @@
 package horosvec
 
 import (
-	"container/heap"
 	"context"
 	"database/sql"
 	"fmt"
@@ -63,10 +62,15 @@ type Index struct {
 	cache    *nodeCache
 	encoder  *Encoder
 	centroid *CentroidTracker
-	medoid   int32
+	medoid   int64
 	dim      int
-	nextID   int32
+	nextID   int64
 	built    bool
+
+	// Flat vector storage for zero-alloc brute-force search.
+	// flatVecs is contiguous: [node0_dim0..node0_dimD, node1_dim0..node1_dimD, ...].
+	flatVecs []float32
+	flatIDs  [][]byte
 
 	mu        sync.RWMutex // protects searches vs. structural changes
 	rebuildMu sync.Mutex   // serializes rebuilds
@@ -74,6 +78,10 @@ type Index struct {
 
 // New creates or loads an Index from the given database.
 func New(db *sql.DB, cfg Config) (*Index, error) {
+	if err := configureSQLite(db); err != nil {
+		return nil, fmt.Errorf("horosvec: configure sqlite: %w", err)
+	}
+
 	if err := initSchema(db); err != nil {
 		return nil, fmt.Errorf("horosvec: init schema: %w", err)
 	}
@@ -101,9 +109,40 @@ func New(db *sql.DB, cfg Config) (*Index, error) {
 		}
 
 		warmCache(db, idx.cache, medoid, 2)
+
+		// Load flat vectors for brute-force search
+		if nodeCount <= cfg.BruteForceThreshold {
+			idx.loadFlatVectors()
+		}
 	}
 
 	return idx, nil
+}
+
+// loadFlatVectors loads all vectors into contiguous memory for brute-force search.
+func (idx *Index) loadFlatVectors() {
+	rows, err := idx.db.Query("SELECT ext_id, vector FROM vindex_nodes ORDER BY node_id")
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	flatVecs := make([]float32, 0, int(idx.nextID)*idx.dim)
+	flatIDs := make([][]byte, 0, idx.nextID)
+	for rows.Next() {
+		var extID, vecBlob []byte
+		if err := rows.Scan(&extID, &vecBlob); err != nil {
+			return
+		}
+		vec := deserializeFloat32s(vecBlob)
+		flatVecs = append(flatVecs, vec...)
+		flatIDs = append(flatIDs, extID)
+	}
+	if rows.Err() != nil {
+		return
+	}
+	idx.flatVecs = flatVecs
+	idx.flatIDs = flatIDs
 }
 
 // Build constructs the full index from the given iterator.
@@ -156,7 +195,7 @@ func (idx *Index) Build(ctx context.Context, iter VectorIterator) error {
 	for i, v := range allVecs {
 		code, sqNorm, l1Norm := idx.encoder.Encode(v)
 		nodes[i] = graphNode{
-			id:     int32(i),
+			id:     int64(i),
 			extID:  allIDs[i],
 			vec:    v,
 			code:   code,
@@ -177,16 +216,16 @@ func (idx *Index) Build(ctx context.Context, iter VectorIterator) error {
 	if err != nil {
 		return fmt.Errorf("horosvec: begin tx: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
-	if _, err := tx.Exec("DELETE FROM vec_nodes"); err != nil {
+	if _, err := tx.Exec("DELETE FROM vindex_nodes"); err != nil {
 		return fmt.Errorf("horosvec: clear nodes: %w", err)
 	}
-	if _, err := tx.Exec("DELETE FROM vec_meta"); err != nil {
+	if _, err := tx.Exec("DELETE FROM vindex_meta"); err != nil {
 		return fmt.Errorf("horosvec: clear meta: %w", err)
 	}
 
-	if err := saveGraph(tx, "vec_nodes", nodes, idx.medoid, dim, idx.cfg.MaxDegree, centroid); err != nil {
+	if err := saveGraph(tx, nodes, idx.medoid, dim, idx.cfg.MaxDegree, centroid); err != nil {
 		return fmt.Errorf("horosvec: save graph: %w", err)
 	}
 
@@ -194,7 +233,7 @@ func (idx *Index) Build(ctx context.Context, iter VectorIterator) error {
 		return fmt.Errorf("horosvec: commit: %w", err)
 	}
 
-	idx.nextID = int32(len(nodes))
+	idx.nextID = int64(len(nodes))
 	idx.built = true
 
 	// Populate cache
@@ -202,12 +241,21 @@ func (idx *Index) Build(ctx context.Context, iter VectorIterator) error {
 	for i := range nodes {
 		idx.cache.put(&cachedNode{
 			nodeID:    nodes[i].id,
+			extID:     nodes[i].extID,
 			neighbors: nodes[i].neighbors,
 			vec:       nodes[i].vec,
 			code:      nodes[i].code,
 			sqNorm:    nodes[i].sqNorm,
 			l1Norm:    nodes[i].l1Norm,
 		})
+	}
+
+	// Build flat vector array for brute-force search
+	idx.flatVecs = make([]float32, len(allVecs)*dim)
+	idx.flatIDs = make([][]byte, len(allVecs))
+	for i, v := range allVecs {
+		copy(idx.flatVecs[i*dim:], v)
+		idx.flatIDs[i] = allIDs[i]
 	}
 
 	return nil
@@ -236,8 +284,41 @@ func (idx *Index) Search(query []float32, topK int) ([]Result, error) {
 }
 
 // bruteForceSearch scans all vectors with exact L2. 100% recall, O(N).
+// Uses flat in-memory vectors when available (zero-alloc hot path),
+// falls back to SQL scan otherwise.
 func (idx *Index) bruteForceSearch(query []float32, topK int) ([]Result, error) {
-	rows, err := idx.db.Query("SELECT ext_id, vector FROM vec_nodes")
+	if idx.flatVecs != nil {
+		return idx.bruteForceFlat(query, topK), nil
+	}
+	return idx.bruteForceSQLite(query, topK)
+}
+
+// bruteForceFlat scans contiguous in-memory vectors. Zero allocs on hot path.
+func (idx *Index) bruteForceFlat(query []float32, topK int) []Result {
+	n := len(idx.flatIDs)
+	dim := idx.dim
+	best := make([]Result, 0, topK+1)
+	worstDist := math.MaxFloat64
+
+	for i := range n {
+		vec := idx.flatVecs[i*dim : (i+1)*dim]
+		d := l2DistanceSquared(query, vec)
+
+		if len(best) < topK || d < worstDist {
+			best = append(best, Result{ID: idx.flatIDs[i], Score: d})
+			sortResults(best)
+			if len(best) > topK {
+				best = best[:topK]
+			}
+			worstDist = best[len(best)-1].Score
+		}
+	}
+	return best
+}
+
+// bruteForceSQLite scans all vectors from the database. Used when flat vectors aren't available.
+func (idx *Index) bruteForceSQLite(query []float32, topK int) ([]Result, error) {
+	rows, err := idx.db.Query("SELECT ext_id, vector FROM vindex_nodes")
 	if err != nil {
 		return nil, fmt.Errorf("horosvec: brute force scan: %w", err)
 	}
@@ -292,7 +373,7 @@ func (idx *Index) vamanaSearch(query []float32, topK int) ([]Result, error) {
 		candidates = candidates[:rerankN]
 	}
 	for i := range candidates {
-		node, err := loadNode(idx.db, idx.cache, candidates[i].nodeID)
+		node, err := loadNodeReadOnly(idx.db, idx.cache, candidates[i].nodeID)
 		if err != nil {
 			candidates[i].dist = math.MaxFloat64
 			continue
@@ -305,14 +386,16 @@ func (idx *Index) vamanaSearch(query []float32, topK int) ([]Result, error) {
 		candidates = candidates[:topK]
 	}
 
-	results := make([]Result, len(candidates))
-	for i, c := range candidates {
-		var extID []byte
-		err := idx.db.QueryRow("SELECT ext_id FROM vec_nodes WHERE node_id = ?", c.nodeID).Scan(&extID)
-		if err != nil {
+	// Resolve ext_ids from cache (no SQL per result, read-only cache access)
+	results := make([]Result, 0, len(candidates))
+	for _, c := range candidates {
+		node, err := loadNodeReadOnly(idx.db, idx.cache, c.nodeID)
+		if err != nil || node.extID == nil {
 			continue
 		}
-		results[i] = Result{ID: extID, Score: c.dist}
+		idCopy := make([]byte, len(node.extID))
+		copy(idCopy, node.extID)
+		results = append(results, Result{ID: idCopy, Score: c.dist})
 	}
 
 	return results, nil
@@ -334,69 +417,68 @@ func sortResults(results []Result) {
 // rabitqGreedySearch performs best-first beam search on the Vamana graph.
 // Uses RaBitQ asymmetric distances for fast approximate graph navigation.
 // The query is centered once and reused for all distance computations.
+// Uses pooled searchState for zero-alloc steady state (bitset visited,
+// typed heap without interface boxing, pre-allocated best list).
 func (idx *Index) rabitqGreedySearch(query []float32, L int) []searchCandidate {
-	visited := make(map[int32]bool)
+	state := acquireSearchState(idx.nextID, L, idx.dim)
+	defer releaseSearchState(state)
 
-	// Pre-compute query centering and squared norm (reused for every RaBitQ distance)
-	queryCentered := make([]float64, idx.dim)
+	// Pre-compute query centering and squared norm (into pooled buffer)
 	var querySqNorm float64
 	for i := range idx.dim {
 		c := float64(query[i]) - float64(idx.encoder.centroid[i])
-		queryCentered[i] = c
+		state.queryCentered[i] = c
 		querySqNorm += c * c
 	}
 
-	medoidNode, err := loadNode(idx.db, idx.cache, idx.medoid)
+	medoidNode, err := loadNodeReadOnly(idx.db, idx.cache, idx.medoid)
 	if err != nil {
 		return nil
 	}
-	visited[idx.medoid] = true
+	state.visit(idx.medoid)
 
-	startDist := rabitqDistanceAsymPrecomp(queryCentered, querySqNorm, medoidNode.code, medoidNode.sqNorm, medoidNode.l1Norm)
+	startDist := rabitqDistanceAsymPrecomp(state.queryCentered, querySqNorm, medoidNode.code, medoidNode.sqNorm, medoidNode.l1Norm)
 
-	h := &candidateHeap{{nodeID: idx.medoid, dist: startDist}}
-	heap.Init(h)
-
-	best := []searchCandidate{{nodeID: idx.medoid, dist: startDist}}
+	state.pushHeap(searchCandidate{nodeID: idx.medoid, dist: startDist})
+	state.insertBest(searchCandidate{nodeID: idx.medoid, dist: startDist}, L)
 	worstBest := startDist
 
-	for h.Len() > 0 {
-		cur := heap.Pop(h).(searchCandidate)
+	for state.heapLen > 0 {
+		cur := state.popHeap()
 
-		if len(best) >= L && cur.dist > worstBest {
+		if len(state.best) >= L && cur.dist > worstBest {
 			break
 		}
 
-		curNode, err := loadNode(idx.db, idx.cache, cur.nodeID)
+		curNode, err := loadNodeReadOnly(idx.db, idx.cache, cur.nodeID)
 		if err != nil {
 			continue
 		}
 
 		for _, nbr := range curNode.neighbors {
-			if visited[nbr] {
+			if !state.visit(nbr) {
 				continue
 			}
-			visited[nbr] = true
 
-			nbrNode, err := loadNode(idx.db, idx.cache, nbr)
+			nbrNode, err := loadNodeReadOnly(idx.db, idx.cache, nbr)
 			if err != nil {
 				continue
 			}
 
-			d := rabitqDistanceAsymPrecomp(queryCentered, querySqNorm, nbrNode.code, nbrNode.sqNorm, nbrNode.l1Norm)
+			d := rabitqDistanceAsymPrecomp(state.queryCentered, querySqNorm, nbrNode.code, nbrNode.sqNorm, nbrNode.l1Norm)
 
-			if len(best) < L || d < worstBest {
-				heap.Push(h, searchCandidate{nodeID: nbr, dist: d})
-				best = insertSorted(best, searchCandidate{nodeID: nbr, dist: d})
-				if len(best) > L {
-					best = best[:L]
-				}
-				worstBest = best[len(best)-1].dist
+			if len(state.best) < L || d < worstBest {
+				state.pushHeap(searchCandidate{nodeID: nbr, dist: d})
+				state.insertBest(searchCandidate{nodeID: nbr, dist: d}, L)
+				worstBest = state.worstBestDist()
 			}
 		}
 	}
 
-	return best
+	// Copy results out (state is pooled and will be reused)
+	result := make([]searchCandidate, len(state.best))
+	copy(result, state.best)
+	return result
 }
 
 // SearchWithRerank searches and then reranks top candidates using exact vectors.
@@ -488,7 +570,7 @@ func (idx *Index) Insert(vecs [][]float32, ids [][]byte) error {
 	if err != nil {
 		return fmt.Errorf("horosvec: begin tx: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	for i, vec := range vecs {
 		nodeID := idx.nextID
@@ -496,11 +578,11 @@ func (idx *Index) Insert(vecs [][]float32, ids [][]byte) error {
 
 		code, sqNorm, l1Norm := idx.encoder.Encode(vec)
 
-		if err := saveNode(tx, "vec_nodes", nodeID, ids[i], nil, vec, code, sqNorm, l1Norm); err != nil {
+		if err := saveNode(tx, nodeID, ids[i], nil, vec, code, sqNorm, l1Norm); err != nil {
 			return fmt.Errorf("horosvec: save new node: %w", err)
 		}
 
-		getNeighbors := func(id int32) []int32 {
+		getNeighbors := func(id int64) []int64 {
 			if id == nodeID {
 				return nil
 			}
@@ -511,28 +593,31 @@ func (idx *Index) Insert(vecs [][]float32, ids [][]byte) error {
 			return n.neighbors
 		}
 
-		setNeighbors := func(id int32, neighbors []int32) {
-			if err := updateNeighbors(tx, "vec_nodes", id, neighbors); err != nil {
-				return
+		setNeighbors := func(id int64, neighbors []int64) error {
+			if err := updateNeighbors(tx, id, neighbors); err != nil {
+				return err
 			}
 			if cached := idx.cache.get(id); cached != nil {
 				cached.neighbors = neighbors
 			}
+			return nil
 		}
 
 		// Find nearest neighbors via rabitq search
 		candidates := idx.rabitqGreedySearch(vec, idx.cfg.SearchListSize)
 
-		neighbors := make([]int32, 0, idx.cfg.MaxDegree)
+		neighbors := make([]int64, 0, idx.cfg.MaxDegree)
 		for _, c := range candidates {
 			if len(neighbors) >= idx.cfg.MaxDegree {
 				break
 			}
 			neighbors = append(neighbors, c.nodeID)
 		}
-		setNeighbors(nodeID, neighbors)
+		if err := setNeighbors(nodeID, neighbors); err != nil {
+			return fmt.Errorf("horosvec: set neighbors for new node: %w", err)
+		}
 
-		// Add reverse edges
+		// Add reverse edges (best-effort: don't fail the whole insert)
 		for _, nbr := range neighbors {
 			nbrNeighbors := getNeighbors(nbr)
 			if nbrNeighbors == nil {
@@ -546,18 +631,25 @@ func (idx *Index) Insert(vecs [][]float32, ids [][]byte) error {
 				}
 			}
 			if !found && len(nbrNeighbors) < idx.cfg.MaxDegree {
-				setNeighbors(nbr, append(nbrNeighbors, nodeID))
+				_ = setNeighbors(nbr, append(nbrNeighbors, nodeID))
 			}
 		}
 
 		idx.cache.put(&cachedNode{
 			nodeID:    nodeID,
+			extID:     ids[i],
 			neighbors: neighbors,
 			vec:       vec,
 			code:      code,
 			sqNorm:    sqNorm,
 			l1Norm:    l1Norm,
 		})
+
+		// Update flat vector storage for brute-force search
+		if idx.flatVecs != nil {
+			idx.flatVecs = append(idx.flatVecs, vec...)
+			idx.flatIDs = append(idx.flatIDs, ids[i])
+		}
 
 		idx.centroid.Add(vec)
 	}
@@ -592,10 +684,6 @@ func (idx *Index) RebuildAsync(ctx context.Context, iter VectorIterator) {
 }
 
 func (idx *Index) rebuildInternal(ctx context.Context, iter VectorIterator) {
-	if err := initSchemaNew(idx.db); err != nil {
-		return
-	}
-
 	var allVecs [][]float32
 	var allIDs [][]byte
 	for {
@@ -634,7 +722,7 @@ func (idx *Index) rebuildInternal(ctx context.Context, iter VectorIterator) {
 	for i, v := range allVecs {
 		code, sqNorm, l1Norm := enc.Encode(v)
 		nodes[i] = graphNode{
-			id:     int32(i),
+			id:     int64(i),
 			extID:  allIDs[i],
 			vec:    v,
 			code:   code,
@@ -654,9 +742,17 @@ func (idx *Index) rebuildInternal(ctx context.Context, iter VectorIterator) {
 	if err != nil {
 		return
 	}
+	defer func() { _ = tx.Rollback() }()
 
-	if err := saveGraph(tx, "vec_nodes_new", nodes, medoid, dim, idx.cfg.MaxDegree, centroid); err != nil {
-		tx.Rollback()
+	// Clear and rebuild in-place
+	if _, err := tx.Exec("DELETE FROM vindex_nodes"); err != nil {
+		return
+	}
+	if _, err := tx.Exec("DELETE FROM vindex_meta"); err != nil {
+		return
+	}
+
+	if err := saveGraph(tx, nodes, medoid, dim, idx.cfg.MaxDegree, centroid); err != nil {
 		return
 	}
 
@@ -667,17 +763,21 @@ func (idx *Index) rebuildInternal(ctx context.Context, iter VectorIterator) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
-	if err := swapIndex(idx.db); err != nil {
-		return
-	}
-
 	idx.medoid = medoid
 	idx.dim = dim
 	idx.encoder = enc
-	idx.nextID = int32(len(nodes))
+	idx.nextID = int64(len(nodes))
 	idx.centroid = NewCentroidTracker(dim, idx.cfg.DriftThreshold, idx.cfg.InsertRatioThreshold)
 	idx.centroid.AddBatch(allVecs)
 	idx.centroid.SnapshotBuild()
+
+	// Build flat vector array for brute-force search
+	idx.flatVecs = make([]float32, len(allVecs)*dim)
+	idx.flatIDs = make([][]byte, len(allVecs))
+	for i, v := range allVecs {
+		copy(idx.flatVecs[i*dim:], v)
+		idx.flatIDs[i] = allIDs[i]
+	}
 
 	idx.cache.clear()
 	warmCache(idx.db, idx.cache, medoid, 2)
