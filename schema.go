@@ -58,18 +58,19 @@ func loadNode(db *sql.DB, cache *nodeCache, nodeID int64) (*cachedNode, error) {
 		return cached, nil
 	}
 
-	var neighbors, vectorBlob, code []byte
+	var extID, neighbors, vectorBlob, code []byte
 	var sqNorm, l1Norm float64
 	err := db.QueryRow(
-		"SELECT neighbors, vector, quantized, sq_norm, l1_norm FROM vindex_nodes WHERE node_id = ?",
+		"SELECT ext_id, neighbors, vector, quantized, sq_norm, l1_norm FROM vindex_nodes WHERE node_id = ?",
 		nodeID,
-	).Scan(&neighbors, &vectorBlob, &code, &sqNorm, &l1Norm)
+	).Scan(&extID, &neighbors, &vectorBlob, &code, &sqNorm, &l1Norm)
 	if err != nil {
 		return nil, err
 	}
 
 	node := &cachedNode{
 		nodeID:    nodeID,
+		extID:     extID,
 		neighbors: deserializeInt64s(neighbors),
 		vec:       deserializeFloat32s(vectorBlob),
 		code:      code,
@@ -78,6 +79,15 @@ func loadNode(db *sql.DB, cache *nodeCache, nodeID int64) (*cachedNode, error) {
 	}
 	cache.put(node)
 	return node, nil
+}
+
+// loadNodeReadOnly loads a node using read-only cache access (no LRU promotion).
+// Falls back to full loadNode on cache miss.
+func loadNodeReadOnly(db *sql.DB, cache *nodeCache, nodeID int64) (*cachedNode, error) {
+	if cached := cache.getReadOnly(nodeID); cached != nil {
+		return cached, nil
+	}
+	return loadNode(db, cache, nodeID)
 }
 
 // saveGraph persists all nodes and metadata from a build.
