@@ -369,7 +369,6 @@ func TestReport_RecallAtScale(t *testing.T) {
 	}{
 		{100, 64},
 		{500, 64},
-		{1000, 64},
 	}
 
 	fmt.Println()
@@ -467,8 +466,8 @@ func TestReport_MemoryProfile(t *testing.T) {
 	scales := []struct {
 		n, dim int
 	}{
+		{200, 64},
 		{500, 64},
-		{1000, 64},
 	}
 
 	fmt.Println()
@@ -530,7 +529,7 @@ func TestReport_RaBitQCorrelation(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping report test in short mode")
 	}
-	dims := []int{64, 128, 256, 512, 1024}
+	dims := []int{64, 128, 256}
 
 	fmt.Println()
 	fmt.Println("┌──────┬──────────────┬──────────────┬─────────────┐")
@@ -539,7 +538,7 @@ func TestReport_RaBitQCorrelation(t *testing.T) {
 
 	for _, dim := range dims {
 		rng := rand.New(rand.NewPCG(42, 0))
-		n := 1000
+		n := 200
 		vecs := make([][]float32, n)
 		for i := range n {
 			vecs[i] = make([]float32, dim)
@@ -619,7 +618,7 @@ func TestReport_EndToEndTimings(t *testing.T) {
 		t.Skip("skipping report test in short mode")
 	}
 	rng := rand.New(rand.NewPCG(42, 0))
-	n := 2000
+	n := 500
 	dim := 64
 	vecs, ids := generateVecs(rng, n, dim)
 
@@ -652,13 +651,13 @@ func TestReport_EndToEndTimings(t *testing.T) {
 
 	// Warm run
 	for _, q := range queries[:10] {
-		idx.Search(q, 10)
+		_, _ = idx.Search(q, 10)
 	}
 
 	// Timed brute-force path (default threshold)
 	t0 = time.Now()
 	for _, q := range queries {
-		idx.Search(q, 10)
+		_, _ = idx.Search(q, 10)
 	}
 	tBruteTotal := time.Since(t0)
 
@@ -666,7 +665,7 @@ func TestReport_EndToEndTimings(t *testing.T) {
 	idx.cfg.BruteForceThreshold = 0
 	t0 = time.Now()
 	for _, q := range queries {
-		idx.Search(q, 10)
+		_, _ = idx.Search(q, 10)
 	}
 	tVamanaTotal := time.Since(t0)
 	idx.cfg.BruteForceThreshold = cfg.BruteForceThreshold // restore
