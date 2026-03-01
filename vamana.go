@@ -1,3 +1,4 @@
+// CLAUDE:SUMMARY Vamana graph index for approximate nearest neighbor search with greedy search and robust pruning.
 package horosvec
 
 import (

@@ -1,3 +1,4 @@
+// CLAUDE:SUMMARY SQLite schema DDL, node persistence, metadata storage, index swap, and cache warming.
 package horosvec
 
 import (

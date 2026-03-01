@@ -1,3 +1,4 @@
+// CLAUDE:SUMMARY Thread-safe LRU cache for graph nodes with doubly-linked list eviction.
 package horosvec
 
 import "sync"
