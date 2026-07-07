@@ -41,6 +41,13 @@ type Config struct {
 	// RotationSeed: PCG seed for diagonal signs. 0 means defaultRotationSeed (42).
 	RotationSeed uint64
 
+	// ArenaPath, when non-empty, points to a flat fp16 arena file (produced by
+	// ExportArena). When present and valid at New(), the exact-rerank stage of
+	// Search reads raw vectors from the arena (fp16→fp32 on the fly) instead of
+	// loadNodeReadOnly — no SQL access, no LRU cache pollution on the hot path.
+	// Empty (default): behaviour strictly unchanged.
+	ArenaPath string
+
 	// BuildWorkers controls parallel Vamana graph construction.
 	// 0 (default) uses ~40% of the CPU capacity available to the process
 	// (runtime.GOMAXPROCS(0), which is cgroup-aware since Go 1.25) — horosvec is
@@ -228,6 +235,21 @@ type Index struct {
 	// plan chaud : arènes plates pointer-free pour la boucle greedy (fiche 1 hnswlib).
 	plane      *hotPlane
 	planePatch map[int32][]int32 // overlay voisinages re-câblés depuis dernier buildHotPlane
+
+	// arena : vecteurs bruts fp16 plats en lecture seule pour l'étape de rerank
+	// (opt-in via Config.ArenaPath). nil = chemin loadNodeReadOnly (SQL) inchangé.
+	arena *arena
+	// rerankSQLLoads compte les chargements SQL (loadNodeReadOnly) déclenchés par
+	// la boucle de rerank. Avec une arène active couvrant tous les nœuds, ce
+	// compteur reste à 0 (critère C2). Instrumentation d'observabilité.
+	rerankSQLLoads atomic.Int64
+}
+
+// RerankSQLLoads retourne le nombre cumulé de chargements SQL déclenchés par l'étape
+// de rerank exact du Search. Avec une arène active couvrant tous les nœuds, ce compteur
+// reste à 0 (aucun accès SQL, aucune pollution du cache LRU sur le chemin chaud).
+func (idx *Index) RerankSQLLoads() int64 {
+	return idx.rerankSQLLoads.Load()
 }
 
 // New creates or loads an Index from the given database.
@@ -285,6 +307,21 @@ func New(db *sql.DB, cfg Config) (*Index, error) {
 
 		if err := idx.rebuildPlaneLocked(); err != nil {
 			return nil, fmt.Errorf("horosvec: build hot plane on load: %w", err)
+		}
+
+		// Arène fp16 opt-in : ouverte et validée contre (dim, count) de l'index.
+		if cfg.ArenaPath != "" {
+			ar, arErr := openArena(cfg.ArenaPath)
+			if arErr != nil {
+				return nil, arErr
+			}
+			if ar.dim != idx.dim {
+				return nil, fmt.Errorf("horosvec: arena dim %d != index dim %d", ar.dim, idx.dim)
+			}
+			if ar.count != int64(nodeCount) {
+				return nil, fmt.Errorf("horosvec: arena count %d != index node_count %d", ar.count, nodeCount)
+			}
+			idx.arena = ar
 		}
 	}
 
@@ -585,11 +622,24 @@ func (idx *Index) vamanaSearch(ctx context.Context, query []float32, topK int) (
 	if len(candidates) > rerankN {
 		candidates = candidates[:rerankN]
 	}
+	// Buffer réutilisé pour décoder un vecteur d'arène (fp16→fp32) sans allocation
+	// par candidat. Alloué une fois par Search.
+	var arenaVec []float32
+	if idx.arena != nil {
+		arenaVec = make([]float32, idx.dim)
+	}
 	for i := range candidates {
 		if err := ctx.Err(); err != nil {
 			return nil, fmt.Errorf("horosvec: %w", err)
 		}
+		// Chemin recâblé : lire le vecteur brut depuis l'arène fp16 (aucun SQL,
+		// aucune pollution du cache LRU). Sans arène, chemin loadNodeReadOnly inchangé.
+		if idx.arena != nil && idx.arena.vecInto(candidates[i].nodeID, arenaVec) {
+			candidates[i].dist = l2DistanceSquared(query, arenaVec)
+			continue
+		}
 		node, err := loadNodeReadOnly(ctx, idx.db, idx.cache, candidates[i].nodeID)
+		idx.rerankSQLLoads.Add(1)
 		if err != nil {
 			candidates[i].dist = math.MaxFloat64
 			continue
