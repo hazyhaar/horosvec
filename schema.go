@@ -101,8 +101,16 @@ func loadNodeReadOnly(ctx context.Context, db *sql.DB, cache *nodeCache, nodeID 
 	return loadNode(ctx, db, cache, nodeID)
 }
 
+// rotationMeta holds persisted rotation parameters for vindex_meta.
+type rotationMeta struct {
+	seed     uint64
+	rounds   int
+	codeDim  int
+	dbFormat int
+}
+
 // saveGraph persists all nodes and metadata from a build.
-func saveGraph(tx *sql.Tx, nodes []graphNode, medoid int64, dim int, maxDegree int, centroid []float32) error {
+func saveGraph(tx *sql.Tx, nodes []graphNode, medoid int64, dim int, maxDegree int, centroid []float32, rot rotationMeta) error {
 	for _, n := range nodes {
 		if err := saveNode(tx, n.id, n.extID, n.neighbors, n.vec, n.code, n.sqNorm, n.l1Norm); err != nil {
 			return fmt.Errorf("save node %d: %w", n.id, err)
@@ -110,13 +118,17 @@ func saveGraph(tx *sql.Tx, nodes []graphNode, medoid int64, dim int, maxDegree i
 	}
 
 	metas := map[string][]byte{
-		"medoid":           serializeInt64(medoid),
-		"dimension":        serializeInt64(int64(dim)),
-		"max_degree":       serializeInt64(int64(maxDegree)),
-		"node_count":       serializeInt64(int64(len(nodes))),
-		"centroid":         serializeFloat32s(centroid),
-		"built_at":         []byte(time.Now().UTC().Format(time.RFC3339)),
-		"vectors_at_build": serializeInt64(int64(len(nodes))),
+		"medoid":            serializeInt64(medoid),
+		"dimension":         serializeInt64(int64(dim)),
+		"max_degree":        serializeInt64(int64(maxDegree)),
+		"node_count":        serializeInt64(int64(len(nodes))),
+		"centroid":          serializeFloat32s(centroid),
+		"built_at":          []byte(time.Now().UTC().Format(time.RFC3339)),
+		"vectors_at_build":  serializeInt64(int64(len(nodes))),
+		"db_format_version": serializeInt64(int64(rot.dbFormat)),
+		"rotation_seed":     serializeInt64(int64(rot.seed)),
+		"rotation_rounds":   serializeInt64(int64(rot.rounds)),
+		"code_dim":          serializeInt64(int64(rot.codeDim)),
 	}
 	for k, v := range metas {
 		_, err := tx.Exec(
@@ -181,6 +193,36 @@ func loadIndex(db *sql.DB) (medoid int64, dim int, nodeCount int, centroid []flo
 	}
 
 	return medoid, dim, nodeCount, centroid, vectorsAtBuild, nil
+}
+
+// loadRotationMeta reads rotation parameters from vindex_meta.
+// Absent rotation keys imply identity rotation (rounds=0, codeDim=dim).
+func loadRotationMeta(db *sql.DB, dim int) (rotationMeta, error) {
+	meta := rotationMeta{
+		codeDim:  dim,
+		dbFormat: 1,
+	}
+	if b, err := loadMeta(db, "db_format_version"); err == nil {
+		meta.dbFormat = int(deserializeInt64(b))
+	}
+	if meta.dbFormat > currentDBFormatVersion {
+		return meta, fmt.Errorf("horosvec: unsupported db format version %d (max %d)", meta.dbFormat, currentDBFormatVersion)
+	}
+	roundsBytes, roundsErr := loadMeta(db, "rotation_rounds")
+	if roundsErr != nil {
+		return meta, nil
+	}
+	meta.rounds = int(deserializeInt64(roundsBytes))
+	if b, err := loadMeta(db, "rotation_seed"); err == nil {
+		meta.seed = uint64(deserializeInt64(b))
+	}
+	if b, err := loadMeta(db, "code_dim"); err == nil {
+		meta.codeDim = int(deserializeInt64(b))
+	}
+	if err := validateRotationMeta(dim, meta.codeDim, meta.rounds); err != nil {
+		return meta, err
+	}
+	return meta, nil
 }
 
 // getMaxNodeID returns the current maximum node_id in the table.

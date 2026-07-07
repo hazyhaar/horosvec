@@ -32,6 +32,12 @@ type Config struct {
 	// MedoidStaleThreshold: recompute medoid after this many inserts since last build/recompute.
 	// 0 disables the periodic recompute (stale-ratio guard still applies).
 	MedoidStaleThreshold int // default 10000
+
+	// RotationRounds: randomized Hadamard rounds for RaBitQ (default 1).
+	// 0 disables rotation (identity); legacy indexes without rotation meta use 0.
+	RotationRounds int
+	// RotationSeed: PCG seed for diagonal signs. 0 means defaultRotationSeed (42).
+	RotationSeed uint64
 }
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -48,6 +54,7 @@ func DefaultConfig() Config {
 		DriftThreshold:       0.05,
 		InsertRatioThreshold: 1.0,
 		MedoidStaleThreshold: 10_000,
+		RotationRounds:       1,
 	}
 }
 
@@ -72,6 +79,8 @@ type Index struct {
 	centroid            *CentroidTracker
 	medoid              int64
 	dim                 int
+	codeDim             int
+	rotator             *Rotator
 	nextID              int64
 	built               bool
 	insertedSinceMedoid int64 // resets on Build or medoid recompute
@@ -118,8 +127,14 @@ func New(db *sql.DB, cfg Config) (*Index, error) {
 	// Try to load existing index
 	medoid, dim, nodeCount, centroid, vectorsAtBuild, err := loadIndex(db)
 	if err == nil && nodeCount > 0 {
+		rotMeta, rotErr := loadRotationMeta(db, dim)
+		if rotErr != nil {
+			return nil, rotErr
+		}
 		idx.medoid = medoid
 		idx.dim = dim
+		idx.codeDim = rotMeta.codeDim
+		idx.rotator = NewRotatorWithCodeDim(dim, rotMeta.codeDim, rotMeta.rounds, rotMeta.seed)
 		idx.encoder = NewEncoder(centroid)
 		idx.centroid = NewCentroidTracker(dim, cfg.DriftThreshold, cfg.InsertRatioThreshold)
 		idx.centroid.SetCentroid(centroid, int64(nodeCount))
@@ -213,15 +228,21 @@ func (idx *Index) Build(ctx context.Context, iter VectorIterator) error {
 	}
 	idx.dim = dim
 
-	// Compute centroid
-	centroid := make([]float32, dim)
+	rounds := idx.cfg.RotationRounds
+	seed := effectiveRotationSeed(idx.cfg)
+	idx.rotator = NewRotator(dim, rounds, seed)
+	idx.codeDim = idx.rotator.CodeDim()
+
+	rotated := make([]float32, idx.codeDim)
+	centroid := make([]float32, idx.codeDim)
 	for _, v := range allVecs {
-		for j, val := range v {
+		idx.rotator.Rotate(v, rotated)
+		for j, val := range rotated {
 			centroid[j] += val
 		}
 	}
 	invN := float32(1.0 / float64(len(allVecs)))
-	for j := range dim {
+	for j := range idx.codeDim {
 		centroid[j] *= invN
 	}
 
@@ -230,10 +251,11 @@ func (idx *Index) Build(ctx context.Context, iter VectorIterator) error {
 	idx.centroid.AddBatch(allVecs)
 	idx.centroid.SnapshotBuild()
 
-	// Create graph nodes with RaBitQ codes
+	// Create graph nodes with RaBitQ codes (encoded in rotated/padded space)
 	nodes := make([]graphNode, len(allVecs))
 	for i, v := range allVecs {
-		code, sqNorm, l1Norm := idx.encoder.Encode(v)
+		idx.rotator.Rotate(v, rotated)
+		code, sqNorm, l1Norm := idx.encoder.Encode(rotated)
 		nodes[i] = graphNode{
 			id:     int64(i),
 			extID:  allIDs[i],
@@ -265,7 +287,13 @@ func (idx *Index) Build(ctx context.Context, iter VectorIterator) error {
 		return fmt.Errorf("horosvec: clear meta: %w", err)
 	}
 
-	if err := saveGraph(tx, nodes, idx.medoid, dim, idx.cfg.MaxDegree, centroid); err != nil {
+	rotMeta := rotationMeta{
+		seed:     seed,
+		rounds:   rounds,
+		codeDim:  idx.codeDim,
+		dbFormat: currentDBFormatVersion,
+	}
+	if err := saveGraph(tx, nodes, idx.medoid, dim, idx.cfg.MaxDegree, centroid, rotMeta); err != nil {
 		return fmt.Errorf("horosvec: save graph: %w", err)
 	}
 
@@ -423,8 +451,10 @@ func (idx *Index) vamanaSearch(ctx context.Context, query []float32, topK int) (
 		rerankN = efSearch
 	}
 
-	// Stage 1: RaBitQ beam search (approximate distances)
-	candidates, err := idx.rabitqGreedySearch(ctx, query, efSearch)
+	// Stage 1: RaBitQ beam search on rotated/padded query (separate from raw query)
+	queryRotated := make([]float32, idx.codeDim)
+	idx.rotator.Rotate(query, queryRotated)
+	candidates, err := idx.rabitqGreedySearch(ctx, queryRotated, efSearch)
 	if err != nil {
 		return nil, err
 	}
@@ -495,12 +525,13 @@ func (idx *Index) rabitqGreedySearchInternal(ctx context.Context, query []float3
 			return loadNodeReadOnly(ctx, idx.db, idx.cache, id)
 		}
 	}
-	state := acquireSearchState(maxNodes, beamWidth, idx.dim)
+	state := acquireSearchState(maxNodes, beamWidth, idx.codeDim)
 	defer releaseSearchState(state)
 
-	// Pre-compute query centering and squared norm (into pooled buffer)
+	// Pre-compute query centering and squared norm (into pooled buffer).
+	// query is already rotated/padded; encoder centroid lives in the same space.
 	var querySqNorm float64
-	for i := range idx.dim {
+	for i := range idx.codeDim {
 		c := float64(query[i]) - float64(idx.encoder.centroid[i])
 		state.queryCentered[i] = c
 		querySqNorm += c * c
@@ -699,7 +730,9 @@ func (idx *Index) Insert(ctx context.Context, vecs [][]float32, ids [][]byte) er
 		nodeID := next
 		next++
 
-		code, sqNorm, l1Norm := idx.encoder.Encode(vec)
+		queryRotated := make([]float32, idx.codeDim)
+		idx.rotator.Rotate(vec, queryRotated)
+		code, sqNorm, l1Norm := idx.encoder.Encode(queryRotated)
 
 		if err := saveNode(tx, nodeID, ids[i], nil, vec, code, sqNorm, l1Norm); err != nil {
 			return fmt.Errorf("horosvec: save new node: %w", err)
@@ -731,8 +764,8 @@ func (idx *Index) Insert(ctx context.Context, vecs [][]float32, ids [][]byte) er
 			return nil
 		}
 
-		// Find nearest neighbors via rabitq search (overlay supplies intra-batch visibility).
-		candidates, err := idx.rabitqGreedySearchInternal(ctx, vec, idx.cfg.SearchListSize, next, loadNodeOverlay)
+		// Find nearest neighbors via rabitq search on rotated query (overlay supplies intra-batch visibility).
+		candidates, err := idx.rabitqGreedySearchInternal(ctx, queryRotated, idx.cfg.SearchListSize, next, loadNodeOverlay)
 		if err != nil {
 			return err
 		}
@@ -950,14 +983,23 @@ func (idx *Index) rebuildInternal(ctx context.Context, iter VectorIterator) {
 		}
 	}
 
-	centroid := make([]float32, dim)
+	if idx.rotator == nil {
+		rounds := idx.cfg.RotationRounds
+		seed := effectiveRotationSeed(idx.cfg)
+		idx.rotator = NewRotator(dim, rounds, seed)
+		idx.codeDim = idx.rotator.CodeDim()
+	}
+
+	rotated := make([]float32, idx.codeDim)
+	centroid := make([]float32, idx.codeDim)
 	for _, v := range allVecs {
-		for j, val := range v {
+		idx.rotator.Rotate(v, rotated)
+		for j, val := range rotated {
 			centroid[j] += val
 		}
 	}
 	invN := float32(1.0 / float64(len(allVecs)))
-	for j := range dim {
+	for j := range idx.codeDim {
 		centroid[j] *= invN
 	}
 
@@ -965,7 +1007,8 @@ func (idx *Index) rebuildInternal(ctx context.Context, iter VectorIterator) {
 
 	nodes := make([]graphNode, len(allVecs))
 	for i, v := range allVecs {
-		code, sqNorm, l1Norm := enc.Encode(v)
+		idx.rotator.Rotate(v, rotated)
+		code, sqNorm, l1Norm := enc.Encode(rotated)
 		nodes[i] = graphNode{
 			id:     int64(i),
 			extID:  allIDs[i],
@@ -1004,7 +1047,13 @@ func (idx *Index) rebuildInternal(ctx context.Context, iter VectorIterator) {
 		return
 	}
 
-	if err := saveGraph(tx, nodes, medoid, dim, idx.cfg.MaxDegree, centroid); err != nil {
+	rotMeta := rotationMeta{
+		seed:     idx.rotator.Seed(),
+		rounds:   idx.rotator.Rounds(),
+		codeDim:  idx.codeDim,
+		dbFormat: currentDBFormatVersion,
+	}
+	if err := saveGraph(tx, nodes, medoid, dim, idx.cfg.MaxDegree, centroid, rotMeta); err != nil {
 		slog.Error("horosvec: rebuild save graph failed", "err", err)
 		return
 	}
@@ -1017,6 +1066,7 @@ func (idx *Index) rebuildInternal(ctx context.Context, iter VectorIterator) {
 	idx.medoid = medoid
 	idx.dim = dim
 	idx.encoder = enc
+	idx.codeDim = idx.rotator.CodeDim()
 	idx.nextID = int64(len(nodes))
 	idx.centroid = NewCentroidTracker(dim, idx.cfg.DriftThreshold, idx.cfg.InsertRatioThreshold)
 	idx.centroid.AddBatch(allVecs)
