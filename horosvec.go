@@ -1,0 +1,1050 @@
+package horosvec
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"log/slog"
+	"math"
+	"sync"
+
+	_ "modernc.org/sqlite"
+)
+
+// Config controls the behavior of the Vamana index.
+type Config struct {
+	MaxDegree      int // R: max neighbors per node (default 64)
+	SearchListSize int // L: beam width during build (default 128)
+	BuildPasses    int // number of graph construction passes (default 2)
+	EfSearch       int // beam width during search (default 128)
+	RerankTopN     int // top-N candidates to rerank with exact vectors (default 500)
+	CacheCapacity  int // LRU cache capacity in nodes (default 100000)
+
+	BruteForceThreshold int // below this count, skip Vamana and scan all vectors (default 50000)
+
+	Alpha          float64 // pruning parameter, >1 for longer edges (default 1.2)
+	DriftThreshold float64 // centroid drift ratio to trigger rebuild (default 0.05)
+	// InsertRatioThreshold: inserts/buildCount ratio to trigger rebuild (default 1.0).
+	// 1.0 means rebuild only after insert volume matches the built corpus; 0.30 fired too
+	// often on incremental backfill and thrashed async rebuilds without recall gain.
+	InsertRatioThreshold float64
+
+	// MedoidStaleThreshold: recompute medoid after this many inserts since last build/recompute.
+	// 0 disables the periodic recompute (stale-ratio guard still applies).
+	MedoidStaleThreshold int // default 10000
+}
+
+// DefaultConfig returns a Config with sensible defaults.
+func DefaultConfig() Config {
+	return Config{
+		MaxDegree:            64,
+		SearchListSize:       128,
+		BuildPasses:          2,
+		EfSearch:             128,
+		RerankTopN:           500,
+		CacheCapacity:        100_000,
+		BruteForceThreshold:  50_000,
+		Alpha:                1.2,
+		DriftThreshold:       0.05,
+		InsertRatioThreshold: 1.0,
+		MedoidStaleThreshold: 10_000,
+	}
+}
+
+// VectorIterator provides vectors for batch building.
+type VectorIterator interface {
+	Next() (id []byte, vec []float32, ok bool)
+	Reset() error
+}
+
+// Result represents a search result.
+type Result struct {
+	ID    []byte
+	Score float64 // lower = closer (L2 distance squared)
+}
+
+// Index is a Vamana ANN index backed by SQLite.
+type Index struct {
+	db                  *sql.DB
+	cfg                 Config
+	cache               *nodeCache
+	encoder             *Encoder
+	centroid            *CentroidTracker
+	medoid              int64
+	dim                 int
+	nextID              int64
+	built               bool
+	insertedSinceMedoid int64 // resets on Build or medoid recompute
+
+	// Flat vector storage for zero-alloc brute-force search.
+	// flatVecs is contiguous: [node0_dim0..node0_dimD, node1_dim0..node1_dimD, ...].
+	flatVecs []float32
+	flatIDs  [][]byte
+
+	mu        sync.RWMutex // protects searches vs. structural changes
+	rebuildMu sync.Mutex   // serializes rebuilds
+
+	// testDuringRebuildPersist is set by tests to run code while idx.mu is held during rebuild persist.
+	testDuringRebuildPersist func()
+
+	// testBeforeInsertCommit is set by tests to sabotage the insert transaction before commit.
+	testBeforeInsertCommit func(tx *sql.Tx)
+
+	// testDuringGreedySearch is set by tests to run code once per heap iteration in rabitqGreedySearchInternal.
+	testDuringGreedySearch func()
+
+	// standalone mode (db == nil): meta key/value pairs loaded from binary export,
+	// preserved for round-trip ExportBinary. Insertion order kept via standaloneMetaKeys.
+	standaloneMeta     map[string][]byte
+	standaloneMetaKeys []string
+}
+
+// New creates or loads an Index from the given database.
+func New(db *sql.DB, cfg Config) (*Index, error) {
+	if err := configureSQLite(db); err != nil {
+		return nil, fmt.Errorf("horosvec: configure sqlite: %w", err)
+	}
+
+	if err := initSchema(db); err != nil {
+		return nil, fmt.Errorf("horosvec: init schema: %w", err)
+	}
+
+	idx := &Index{
+		db:    db,
+		cfg:   cfg,
+		cache: newNodeCache(cfg.CacheCapacity),
+	}
+
+	// Try to load existing index
+	medoid, dim, nodeCount, centroid, vectorsAtBuild, err := loadIndex(db)
+	if err == nil && nodeCount > 0 {
+		idx.medoid = medoid
+		idx.dim = dim
+		idx.encoder = NewEncoder(centroid)
+		idx.centroid = NewCentroidTracker(dim, cfg.DriftThreshold, cfg.InsertRatioThreshold)
+		idx.centroid.SetCentroid(centroid, int64(nodeCount))
+		idx.centroid.SetBuildCentroid(centroid, vectorsAtBuild)
+		idx.built = true
+
+		maxID, err := getMaxNodeID(db)
+		if err == nil {
+			idx.nextID = maxID + 1
+		}
+
+		// Guard against stale medoid (e.g. node deleted or incremental inserts
+		// added new nodes without recomputing). Recompute and persist if needed.
+		refreshed, err := checkAndRefreshMedoid(db, medoid)
+		if err != nil {
+			return nil, fmt.Errorf("horosvec: validate medoid: %w", err)
+		}
+		idx.medoid = refreshed
+
+		warmCache(context.Background(), db, idx.cache, idx.medoid, 2)
+
+		// Load flat vectors for brute-force search
+		if nodeCount <= cfg.BruteForceThreshold {
+			idx.loadFlatVectors()
+		}
+	}
+
+	return idx, nil
+}
+
+// loadFlatVectors loads all vectors into contiguous memory for brute-force search.
+func (idx *Index) loadFlatVectors() {
+	rows, err := idx.db.Query("SELECT ext_id, vector FROM vindex_nodes ORDER BY node_id")
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	flatVecs := make([]float32, 0, int(idx.nextID)*idx.dim)
+	flatIDs := make([][]byte, 0, idx.nextID)
+	for rows.Next() {
+		var extID, vecBlob []byte
+		if err := rows.Scan(&extID, &vecBlob); err != nil {
+			return
+		}
+		vec := deserializeFloat32s(vecBlob)
+		flatVecs = append(flatVecs, vec...)
+		flatIDs = append(flatIDs, extID)
+	}
+	if rows.Err() != nil {
+		return
+	}
+	idx.flatVecs = flatVecs
+	idx.flatIDs = flatIDs
+}
+
+// Build constructs the full index from the given iterator.
+// Takes exclusive mu.Lock — blocks all Search/Insert. Mutates: dim, encoder, centroid, medoid, built, flatVecs, flatIDs, nextID. Must be called before Insert/Search.
+func (idx *Index) Build(ctx context.Context, iter VectorIterator) error {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	var allVecs [][]float32
+	var allIDs [][]byte
+
+	for {
+		id, vec, ok := iter.Next()
+		if !ok {
+			break
+		}
+		idCopy := make([]byte, len(id))
+		copy(idCopy, id)
+		vecCopy := make([]float32, len(vec))
+		copy(vecCopy, vec)
+		allVecs = append(allVecs, vecCopy)
+		allIDs = append(allIDs, idCopy)
+	}
+
+	if len(allVecs) == 0 {
+		return fmt.Errorf("horosvec: no vectors provided")
+	}
+
+	dim := len(allVecs[0])
+	if dim == 0 {
+		return fmt.Errorf("horosvec: first vector is empty")
+	}
+	for i, v := range allVecs {
+		if len(v) != dim {
+			return fmt.Errorf("horosvec: heterogeneous vector dim: vec[%d] has %d, want %d", i, len(v), dim)
+		}
+	}
+	idx.dim = dim
+
+	// Compute centroid
+	centroid := make([]float32, dim)
+	for _, v := range allVecs {
+		for j, val := range v {
+			centroid[j] += val
+		}
+	}
+	invN := float32(1.0 / float64(len(allVecs)))
+	for j := range dim {
+		centroid[j] *= invN
+	}
+
+	idx.encoder = NewEncoder(centroid)
+	idx.centroid = NewCentroidTracker(dim, idx.cfg.DriftThreshold, idx.cfg.InsertRatioThreshold)
+	idx.centroid.AddBatch(allVecs)
+	idx.centroid.SnapshotBuild()
+
+	// Create graph nodes with RaBitQ codes
+	nodes := make([]graphNode, len(allVecs))
+	for i, v := range allVecs {
+		code, sqNorm, l1Norm := idx.encoder.Encode(v)
+		nodes[i] = graphNode{
+			id:     int64(i),
+			extID:  allIDs[i],
+			vec:    v,
+			code:   code,
+			sqNorm: sqNorm,
+			l1Norm: l1Norm,
+		}
+	}
+
+	idx.medoid = findMedoid(nodes)
+	buildGraph(ctx, nodes, idx.medoid, idx.cfg.MaxDegree, idx.cfg.SearchListSize, idx.cfg.Alpha, idx.cfg.BuildPasses)
+
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	// Persist
+	tx, err := idx.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("horosvec: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.Exec("DELETE FROM vindex_nodes"); err != nil {
+		return fmt.Errorf("horosvec: clear nodes: %w", err)
+	}
+	if _, err := tx.Exec("DELETE FROM vindex_meta"); err != nil {
+		return fmt.Errorf("horosvec: clear meta: %w", err)
+	}
+
+	if err := saveGraph(tx, nodes, idx.medoid, dim, idx.cfg.MaxDegree, centroid); err != nil {
+		return fmt.Errorf("horosvec: save graph: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("horosvec: commit: %w", err)
+	}
+
+	idx.nextID = int64(len(nodes))
+	idx.built = true
+	idx.insertedSinceMedoid = 0
+
+	// Populate cache
+	idx.cache.clear()
+	for i := range nodes {
+		idx.cache.put(&cachedNode{
+			nodeID:    nodes[i].id,
+			extID:     nodes[i].extID,
+			neighbors: nodes[i].neighbors,
+			vec:       nodes[i].vec,
+			code:      nodes[i].code,
+			sqNorm:    nodes[i].sqNorm,
+			l1Norm:    nodes[i].l1Norm,
+		})
+	}
+
+	// Build flat vector array for brute-force search
+	idx.flatVecs = make([]float32, len(allVecs)*dim)
+	idx.flatIDs = make([][]byte, len(allVecs))
+	for i, v := range allVecs {
+		copy(idx.flatVecs[i*dim:], v)
+		idx.flatIDs[i] = allIDs[i]
+	}
+
+	return nil
+}
+
+// Search finds the topK nearest neighbors.
+// For small indices (<= BruteForceThreshold): exact brute-force scan, 100% recall.
+// For large indices: 2-stage RaBitQ beam search + L2 rerank.
+// RLock allows concurrent Search but not Insert. vamanaSearch uses idx.nextID as bitset capacity — if Insert grows nextID concurrently, bitset undersized.
+func (idx *Index) Search(ctx context.Context, query []float32, topK int) ([]Result, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("horosvec: %w", err)
+	}
+
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+
+	if !idx.built {
+		return nil, fmt.Errorf("horosvec: index not built")
+	}
+	if len(query) != idx.dim {
+		return nil, fmt.Errorf("horosvec: query dim %d != index dim %d", len(query), idx.dim)
+	}
+
+	// Dynamic threshold: brute-force for small shards, Vamana+RaBitQ for large
+	if idx.cfg.BruteForceThreshold > 0 && int(idx.nextID) <= idx.cfg.BruteForceThreshold {
+		return idx.bruteForceSearch(ctx, query, topK)
+	}
+
+	return idx.vamanaSearch(ctx, query, topK)
+}
+
+// bruteForceSearch scans all vectors with exact L2. 100% recall, O(N).
+// Uses flat in-memory vectors when available (zero-alloc hot path),
+// falls back to SQL scan otherwise.
+func (idx *Index) bruteForceSearch(ctx context.Context, query []float32, topK int) ([]Result, error) {
+	if idx.flatVecs != nil {
+		return idx.bruteForceFlat(query, topK), nil
+	}
+	return idx.bruteForceSQLite(ctx, query, topK)
+}
+
+// bruteForceFlat scans contiguous in-memory vectors. Zero allocs on hot path.
+func (idx *Index) bruteForceFlat(query []float32, topK int) []Result {
+	n := len(idx.flatIDs)
+	dim := idx.dim
+	best := make([]Result, 0, topK+1)
+	worstDist := math.MaxFloat64
+
+	for i := range n {
+		vec := idx.flatVecs[i*dim : (i+1)*dim]
+		d := l2DistanceSquared(query, vec)
+
+		if len(best) < topK || d < worstDist {
+			best = append(best, Result{ID: idx.flatIDs[i], Score: d})
+			sortResults(best)
+			if len(best) > topK {
+				best = best[:topK]
+			}
+			worstDist = best[len(best)-1].Score
+		}
+	}
+	return best
+}
+
+// bruteForceSQLite scans all vectors from the database. Used when flat vectors aren't available.
+func (idx *Index) bruteForceSQLite(ctx context.Context, query []float32, topK int) ([]Result, error) {
+	rows, err := idx.db.QueryContext(ctx, "SELECT ext_id, vector FROM vindex_nodes")
+	if err != nil {
+		return nil, fmt.Errorf("horosvec: brute force scan: %w", err)
+	}
+	defer rows.Close()
+
+	best := make([]Result, 0, topK+1)
+	worstDist := math.MaxFloat64
+
+	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("horosvec: %w", err)
+		}
+		var extID, vecBlob []byte
+		if err := rows.Scan(&extID, &vecBlob); err != nil {
+			continue
+		}
+		vec := deserializeFloat32s(vecBlob)
+		d := l2DistanceSquared(query, vec)
+
+		if len(best) < topK || d < worstDist {
+			idCopy := make([]byte, len(extID))
+			copy(idCopy, extID)
+			best = append(best, Result{ID: idCopy, Score: d})
+			sortResults(best)
+			if len(best) > topK {
+				best = best[:topK]
+			}
+			worstDist = best[len(best)-1].Score
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("horosvec: brute force scan: %w", err)
+	}
+
+	return best, nil
+}
+
+// vamanaSearch does 2-stage RaBitQ beam search + L2 rerank.
+// Called under RLock. loadNodeReadOnly fallback to loadNode may promote cache entry (LRU side effect under read path).
+func (idx *Index) vamanaSearch(ctx context.Context, query []float32, topK int) ([]Result, error) {
+	// Determine beam width: wide enough for re-ranking
+	rerankN := idx.cfg.RerankTopN
+	if rerankN < topK*3 {
+		rerankN = topK * 3
+	}
+	efSearch := idx.cfg.EfSearch
+	if efSearch < rerankN {
+		efSearch = rerankN
+	}
+
+	// Stage 1: RaBitQ beam search (approximate distances)
+	candidates, err := idx.rabitqGreedySearch(ctx, query, efSearch)
+	if err != nil {
+		return nil, err
+	}
+
+	// Stage 2: Re-rank top candidates with exact L2
+	if len(candidates) > rerankN {
+		candidates = candidates[:rerankN]
+	}
+	for i := range candidates {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("horosvec: %w", err)
+		}
+		node, err := loadNodeReadOnly(ctx, idx.db, idx.cache, candidates[i].nodeID)
+		if err != nil {
+			candidates[i].dist = math.MaxFloat64
+			continue
+		}
+		candidates[i].dist = l2DistanceSquared(query, node.vec)
+	}
+	sortCandidates(candidates)
+
+	if len(candidates) > topK {
+		candidates = candidates[:topK]
+	}
+
+	// Resolve ext_ids from cache (no SQL per result, read-only cache access)
+	results := make([]Result, 0, len(candidates))
+	for _, c := range candidates {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("horosvec: %w", err)
+		}
+		node, err := loadNodeReadOnly(ctx, idx.db, idx.cache, c.nodeID)
+		if err != nil || node.extID == nil {
+			continue
+		}
+		idCopy := make([]byte, len(node.extID))
+		copy(idCopy, node.extID)
+		results = append(results, Result{ID: idCopy, Score: c.dist})
+	}
+
+	return results, nil
+}
+
+// sortResults sorts results by score (ascending).
+func sortResults(results []Result) {
+	for i := 1; i < len(results); i++ {
+		key := results[i]
+		j := i - 1
+		for j >= 0 && results[j].Score > key.Score {
+			results[j+1] = results[j]
+			j--
+		}
+		results[j+1] = key
+	}
+}
+
+// rabitqGreedySearch performs best-first beam search on the Vamana graph.
+func (idx *Index) rabitqGreedySearch(ctx context.Context, query []float32, beamWidth int) ([]searchCandidate, error) {
+	return idx.rabitqGreedySearchInternal(ctx, query, beamWidth, idx.nextID, nil)
+}
+
+// rabitqGreedySearchInternal performs beam search with an optional node loader and capacity.
+// When loadFn is nil, committed nodes are loaded via loadNodeReadOnly.
+// Acquires searchState from sync.Pool. If panic before defer release, state leaked. Pool may return dirty state from previous query.
+func (idx *Index) rabitqGreedySearchInternal(ctx context.Context, query []float32, beamWidth int, maxNodes int64, loadFn func(int64) (*cachedNode, error)) ([]searchCandidate, error) {
+	if loadFn == nil {
+		loadFn = func(id int64) (*cachedNode, error) {
+			return loadNodeReadOnly(ctx, idx.db, idx.cache, id)
+		}
+	}
+	state := acquireSearchState(maxNodes, beamWidth, idx.dim)
+	defer releaseSearchState(state)
+
+	// Pre-compute query centering and squared norm (into pooled buffer)
+	var querySqNorm float64
+	for i := range idx.dim {
+		c := float64(query[i]) - float64(idx.encoder.centroid[i])
+		state.queryCentered[i] = c
+		querySqNorm += c * c
+	}
+
+	medoidNode, err := loadFn(idx.medoid)
+	if err != nil {
+		return nil, nil
+	}
+	state.visit(idx.medoid)
+
+	startDist := rabitqDistanceAsymPrecomp(state.queryCentered, querySqNorm, medoidNode.code, medoidNode.sqNorm, medoidNode.l1Norm)
+
+	state.pushHeap(searchCandidate{nodeID: idx.medoid, dist: startDist})
+	state.insertBest(searchCandidate{nodeID: idx.medoid, dist: startDist}, beamWidth)
+	worstBest := startDist
+
+	for state.heapLen > 0 {
+		if idx.testDuringGreedySearch != nil {
+			idx.testDuringGreedySearch()
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("horosvec: greedy search: %w", err)
+		}
+
+		cur := state.popHeap()
+
+		if len(state.best) >= beamWidth && cur.dist > worstBest {
+			break
+		}
+
+		curNode, err := loadFn(cur.nodeID)
+		if err != nil {
+			continue
+		}
+
+		for _, nbr := range curNode.neighbors {
+			if !state.visit(nbr) {
+				continue
+			}
+
+			nbrNode, err := loadFn(nbr)
+			if err != nil {
+				continue
+			}
+
+			d := rabitqDistanceAsymPrecomp(state.queryCentered, querySqNorm, nbrNode.code, nbrNode.sqNorm, nbrNode.l1Norm)
+
+			if len(state.best) < beamWidth || d < worstBest {
+				state.pushHeap(searchCandidate{nodeID: nbr, dist: d})
+				state.insertBest(searchCandidate{nodeID: nbr, dist: d}, beamWidth)
+				worstBest = state.worstBestDist()
+			}
+		}
+	}
+
+	// Copy results out (state is pooled and will be reused)
+	result := make([]searchCandidate, len(state.best))
+	copy(result, state.best)
+	return result, nil
+}
+
+// SearchWithRerank searches and then reranks top candidates using exact vectors.
+func (idx *Index) SearchWithRerank(ctx context.Context, query []float32, topK int, reranker func([][]byte) ([][]float32, error)) ([]Result, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("horosvec: %w", err)
+	}
+
+	rerankN := idx.cfg.RerankTopN
+	if rerankN < topK*3 {
+		rerankN = topK * 3
+	}
+
+	candidates, err := idx.Search(ctx, query, rerankN)
+	if err != nil {
+		return nil, err
+	}
+
+	if reranker == nil || len(candidates) == 0 {
+		if len(candidates) > topK {
+			candidates = candidates[:topK]
+		}
+		return candidates, nil
+	}
+
+	ids := make([][]byte, len(candidates))
+	for i, c := range candidates {
+		ids[i] = c.ID
+	}
+
+	exactVecs, err := reranker(ids)
+	if err != nil {
+		if len(candidates) > topK {
+			candidates = candidates[:topK]
+		}
+		return candidates, nil
+	}
+
+	type scored struct {
+		id   []byte
+		dist float64
+	}
+	reranked := make([]scored, 0, len(exactVecs))
+	for i, vec := range exactVecs {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("horosvec: %w", err)
+		}
+		if vec == nil {
+			continue
+		}
+		d := l2DistanceSquared(query, vec)
+		reranked = append(reranked, scored{id: ids[i], dist: d})
+	}
+
+	for i := 1; i < len(reranked); i++ {
+		key := reranked[i]
+		j := i - 1
+		for j >= 0 && reranked[j].dist > key.dist {
+			reranked[j+1] = reranked[j]
+			j--
+		}
+		reranked[j+1] = key
+	}
+
+	if len(reranked) > topK {
+		reranked = reranked[:topK]
+	}
+
+	results := make([]Result, len(reranked))
+	for i, r := range reranked {
+		results[i] = Result{ID: r.id, Score: r.dist}
+	}
+	return results, nil
+}
+
+// Insert adds new vectors to the index incrementally.
+// Takes mu.Lock. In-memory effects are deferred until after a successful tx.Commit via a local overlay.
+func (idx *Index) Insert(ctx context.Context, vecs [][]float32, ids [][]byte) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("horosvec: %w", err)
+	}
+
+	if len(vecs) != len(ids) {
+		return fmt.Errorf("horosvec: vecs/ids length mismatch: %d vs %d", len(vecs), len(ids))
+	}
+	if len(vecs) == 0 {
+		return nil
+	}
+
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	if !idx.built {
+		return fmt.Errorf("horosvec: index not built, call Build first")
+	}
+	for i, v := range vecs {
+		if len(v) != idx.dim {
+			return fmt.Errorf("horosvec: vec[%d] dim %d != index dim %d", i, len(v), idx.dim)
+		}
+	}
+
+	tx, err := idx.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("horosvec: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	next := idx.nextID
+	pendingNodes := make(map[int64]*cachedNode, len(vecs))
+	pendingNeighbors := make(map[int64][]int64)
+	var pendingFlatVecs []float32
+	var pendingFlatIDs [][]byte
+	pendingCentroidVecs := make([][]float32, 0, len(vecs))
+
+	loadNodeOverlay := func(nodeID int64) (*cachedNode, error) {
+		if pn, ok := pendingNodes[nodeID]; ok {
+			return pn, nil
+		}
+		n, err := loadNode(ctx, idx.db, idx.cache, nodeID)
+		if err != nil {
+			return nil, err
+		}
+		if nb, ok := pendingNeighbors[nodeID]; ok {
+			overlay := *n
+			overlay.neighbors = nb
+			return &overlay, nil
+		}
+		return n, nil
+	}
+
+	for i, vec := range vecs {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("horosvec: %w", err)
+		}
+		nodeID := next
+		next++
+
+		code, sqNorm, l1Norm := idx.encoder.Encode(vec)
+
+		if err := saveNode(tx, nodeID, ids[i], nil, vec, code, sqNorm, l1Norm); err != nil {
+			return fmt.Errorf("horosvec: save new node: %w", err)
+		}
+
+		getNeighbors := func(id int64) []int64 {
+			if pn, ok := pendingNodes[id]; ok {
+				return pn.neighbors
+			}
+			if nb, ok := pendingNeighbors[id]; ok {
+				return nb
+			}
+			n, err := loadNode(ctx, idx.db, idx.cache, id)
+			if err != nil {
+				return nil
+			}
+			return n.neighbors
+		}
+
+		setNeighbors := func(id int64, neighbors []int64) error {
+			if err := updateNeighbors(tx, id, neighbors); err != nil {
+				return err
+			}
+			if pn, ok := pendingNodes[id]; ok {
+				pn.neighbors = neighbors
+				return nil
+			}
+			pendingNeighbors[id] = neighbors
+			return nil
+		}
+
+		// Find nearest neighbors via rabitq search (overlay supplies intra-batch visibility).
+		candidates, err := idx.rabitqGreedySearchInternal(ctx, vec, idx.cfg.SearchListSize, next, loadNodeOverlay)
+		if err != nil {
+			return err
+		}
+
+		neighbors := make([]int64, 0, idx.cfg.MaxDegree)
+		for _, c := range candidates {
+			if len(neighbors) >= idx.cfg.MaxDegree {
+				break
+			}
+			neighbors = append(neighbors, c.nodeID)
+		}
+		if err := setNeighbors(nodeID, neighbors); err != nil {
+			return fmt.Errorf("horosvec: set neighbors for new node: %w", err)
+		}
+
+		getVec := func(id int64) []float32 {
+			if pn, ok := pendingNodes[id]; ok {
+				return pn.vec
+			}
+			n, err := loadNode(ctx, idx.db, idx.cache, id)
+			if err != nil {
+				return nil
+			}
+			return n.vec
+		}
+
+		// Add reverse edges (best-effort: don't fail the whole insert)
+		for _, nbr := range neighbors {
+			nbrNeighbors := getNeighbors(nbr)
+			if nbrNeighbors == nil {
+				continue
+			}
+			found := false
+			for _, nn := range nbrNeighbors {
+				if nn == nodeID {
+					found = true
+					break
+				}
+			}
+			if found {
+				continue
+			}
+			if len(nbrNeighbors) < idx.cfg.MaxDegree {
+				_ = setNeighbors(nbr, append(nbrNeighbors, nodeID))
+				continue
+			}
+			nbrNode, err := loadNodeOverlay(nbr)
+			if err != nil {
+				continue
+			}
+			cands := make([]searchCandidate, 0, len(nbrNeighbors)+1)
+			for _, nn := range nbrNeighbors {
+				nnVec := getVec(nn)
+				if nnVec == nil {
+					continue
+				}
+				cands = append(cands, searchCandidate{
+					nodeID: nn,
+					dist:   l2DistanceSquared(nbrNode.vec, nnVec),
+				})
+			}
+			cands = append(cands, searchCandidate{
+				nodeID: nodeID,
+				dist:   l2DistanceSquared(nbrNode.vec, vec),
+			})
+			pruned := robustPrune(nbr, cands, idx.cfg.Alpha, idx.cfg.MaxDegree, getVec)
+			_ = setNeighbors(nbr, pruned)
+		}
+
+		pendingNodes[nodeID] = &cachedNode{
+			nodeID:    nodeID,
+			extID:     ids[i],
+			neighbors: neighbors,
+			vec:       vec,
+			code:      code,
+			sqNorm:    sqNorm,
+			l1Norm:    l1Norm,
+		}
+
+		if idx.flatVecs != nil {
+			pendingFlatVecs = append(pendingFlatVecs, vec...)
+			pendingFlatIDs = append(pendingFlatIDs, ids[i])
+		}
+
+		pendingCentroidVecs = append(pendingCentroidVecs, vec)
+	}
+
+	if idx.testBeforeInsertCommit != nil {
+		idx.testBeforeInsertCommit(tx)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("horosvec: commit: %w", err)
+	}
+
+	for _, node := range pendingNodes {
+		idx.cache.put(node)
+	}
+	for id, neighbors := range pendingNeighbors {
+		if cached := idx.cache.get(id); cached != nil {
+			cached.neighbors = neighbors
+		}
+	}
+	if idx.flatVecs != nil {
+		idx.flatVecs = append(idx.flatVecs, pendingFlatVecs...)
+		idx.flatIDs = append(idx.flatIDs, pendingFlatIDs...)
+	}
+	idx.nextID = next
+	for _, vec := range pendingCentroidVecs {
+		idx.centroid.Add(vec)
+	}
+
+	idx.insertedSinceMedoid += int64(len(vecs))
+
+	count, _ := getNodeCount(idx.db)
+	_ = updateNodeCountInt64(idx.db, int64(count))
+
+	// Recompute medoid when too many nodes have been added since last build/recompute.
+	// Two triggers: periodic (MedoidStaleThreshold) or >50% new nodes relative to total.
+	if idx.shouldRefreshMedoid(int64(count)) {
+		newMedoid, err := recomputeMedoid(idx.db)
+		if err != nil {
+			slog.Warn("horosvec: medoid recompute after insert failed", "err", err)
+		} else {
+			idx.medoid = newMedoid
+			idx.insertedSinceMedoid = 0
+		}
+	}
+
+	return nil
+}
+
+// shouldRefreshMedoid returns true when the medoid is likely stale due to mass inserts.
+// Called under mu.Lock.
+func (idx *Index) shouldRefreshMedoid(totalNodes int64) bool {
+	if totalNodes == 0 {
+		return false
+	}
+	// Periodic threshold.
+	if idx.cfg.MedoidStaleThreshold > 0 && idx.insertedSinceMedoid >= int64(idx.cfg.MedoidStaleThreshold) {
+		return true
+	}
+	// If more than 50% of nodes were inserted after the last build/recompute.
+	if idx.insertedSinceMedoid*2 > totalNodes {
+		return true
+	}
+	return false
+}
+
+// NeedsRebuild returns true if the index should be rebuilt.
+// Insert updates the centroid via ct.Add() under idx.mu.Lock; CentroidTracker has its own mutex.
+func (idx *Index) NeedsRebuild() bool {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	if idx.centroid == nil {
+		return false
+	}
+	return idx.centroid.NeedsRebuild()
+}
+
+// RebuildAsync starts an asynchronous rebuild.
+// The rebuild runs in a background goroutine protected by rebuildMu.
+// Panics are recovered to prevent deadlock on rebuildMu.
+func (idx *Index) RebuildAsync(ctx context.Context, iter VectorIterator) {
+	idx.rebuildMu.Lock()
+	go func() {
+		defer idx.rebuildMu.Unlock()
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("horosvec: RebuildAsync panic recovered", "panic", r)
+			}
+		}()
+		idx.rebuildInternal(ctx, iter)
+	}()
+}
+
+// rebuildInternal holds idx.mu.Lock across DB commit and in-memory state update so concurrent
+// Insert cannot observe a committed rebuild graph with stale nextID.
+func (idx *Index) rebuildInternal(ctx context.Context, iter VectorIterator) {
+	// Le verrou couvre TOUT le rebuild : drain de l'itérateur, construction du graphe
+	// et persistance. Sans cela, un Insert concurrent validé pendant le drain ou le
+	// buildGraph (hors verrou) est effacé par le DELETE puis nextID régressé — perte de
+	// données. Compromis assumé : les recherches attendent la fin d'un rebuild ; la
+	// correction prime sur la latence (rebuild reste asynchrone côté appelant).
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	var allVecs [][]float32
+	var allIDs [][]byte
+	for {
+		id, vec, ok := iter.Next()
+		if !ok {
+			break
+		}
+		idCopy := make([]byte, len(id))
+		copy(idCopy, id)
+		vecCopy := make([]float32, len(vec))
+		copy(vecCopy, vec)
+		allVecs = append(allVecs, vecCopy)
+		allIDs = append(allIDs, idCopy)
+	}
+
+	if len(allVecs) == 0 {
+		return
+	}
+
+	dim := len(allVecs[0])
+	if dim == 0 {
+		slog.Error("horosvec: rebuild aborted: first vector empty")
+		return
+	}
+	for i, v := range allVecs {
+		if len(v) != dim {
+			slog.Error("horosvec: rebuild aborted: heterogeneous vector dim", "index", i, "got", len(v), "want", dim)
+			return
+		}
+	}
+
+	centroid := make([]float32, dim)
+	for _, v := range allVecs {
+		for j, val := range v {
+			centroid[j] += val
+		}
+	}
+	invN := float32(1.0 / float64(len(allVecs)))
+	for j := range dim {
+		centroid[j] *= invN
+	}
+
+	enc := NewEncoder(centroid)
+
+	nodes := make([]graphNode, len(allVecs))
+	for i, v := range allVecs {
+		code, sqNorm, l1Norm := enc.Encode(v)
+		nodes[i] = graphNode{
+			id:     int64(i),
+			extID:  allIDs[i],
+			vec:    v,
+			code:   code,
+			sqNorm: sqNorm,
+			l1Norm: l1Norm,
+		}
+	}
+
+	medoid := findMedoid(nodes)
+	buildGraph(ctx, nodes, medoid, idx.cfg.MaxDegree, idx.cfg.SearchListSize, idx.cfg.Alpha, idx.cfg.BuildPasses)
+
+	if ctx.Err() != nil {
+		return
+	}
+
+	if idx.testDuringRebuildPersist != nil {
+		idx.testDuringRebuildPersist()
+	}
+
+	tx, err := idx.db.BeginTx(ctx, nil)
+	if err != nil {
+		slog.Error("horosvec: rebuild begin tx failed", "err", err)
+		return
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Clear and rebuild in-place
+	if _, err := tx.Exec("DELETE FROM vindex_nodes"); err != nil {
+		slog.Error("horosvec: rebuild clear nodes failed", "err", err)
+		return
+	}
+	if _, err := tx.Exec("DELETE FROM vindex_meta"); err != nil {
+		slog.Error("horosvec: rebuild clear meta failed", "err", err)
+		return
+	}
+
+	if err := saveGraph(tx, nodes, medoid, dim, idx.cfg.MaxDegree, centroid); err != nil {
+		slog.Error("horosvec: rebuild save graph failed", "err", err)
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		slog.Error("horosvec: rebuild commit failed", "err", err)
+		return
+	}
+
+	idx.medoid = medoid
+	idx.dim = dim
+	idx.encoder = enc
+	idx.nextID = int64(len(nodes))
+	idx.centroid = NewCentroidTracker(dim, idx.cfg.DriftThreshold, idx.cfg.InsertRatioThreshold)
+	idx.centroid.AddBatch(allVecs)
+	idx.centroid.SnapshotBuild()
+
+	// Build flat vector array for brute-force search
+	idx.flatVecs = make([]float32, len(allVecs)*dim)
+	idx.flatIDs = make([][]byte, len(allVecs))
+	for i, v := range allVecs {
+		copy(idx.flatVecs[i*dim:], v)
+		idx.flatIDs[i] = allIDs[i]
+	}
+
+	idx.cache.clear()
+	warmCache(ctx, idx.db, idx.cache, medoid, 2)
+}
+
+// Count returns the number of vectors in the index.
+// RLock protects read, but getNodeCount() SQL query may return stale count if Insert commits between RUnlock and query.
+func (idx *Index) Count() int {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	if idx.db == nil {
+		// Standalone mode: nextID equals the loaded node count.
+		return int(idx.nextID)
+	}
+	count, err := getNodeCount(idx.db)
+	if err != nil {
+		return 0
+	}
+	return count
+}
+
+// Close releases resources. Waits for any in-flight RebuildAsync before returning.
+func (idx *Index) Close() error {
+	idx.rebuildMu.Lock()
+	defer idx.rebuildMu.Unlock()
+	idx.cache.clear()
+	return nil
+}

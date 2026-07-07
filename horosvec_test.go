@@ -1,0 +1,681 @@
+package horosvec
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"fmt"
+	"math/rand/v2"
+	"os"
+	"path/filepath"
+	"sort"
+	"sync"
+	"testing"
+
+	_ "modernc.org/sqlite"
+)
+
+// sliceIterator implements VectorIterator over in-memory slices.
+type sliceIterator struct {
+	vecs [][]float32
+	ids  [][]byte
+	pos  int
+}
+
+func (s *sliceIterator) Next() ([]byte, []float32, bool) {
+	if s.pos >= len(s.vecs) {
+		return nil, nil, false
+	}
+	id := s.ids[s.pos]
+	vec := s.vecs[s.pos]
+	s.pos++
+	return id, vec, true
+}
+
+func (s *sliceIterator) Reset() error {
+	s.pos = 0
+	return nil
+}
+
+func newTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
+func generateVecs(rng *rand.Rand, n, dim int) ([][]float32, [][]byte) {
+	vecs := make([][]float32, n)
+	ids := make([][]byte, n)
+	for i := range n {
+		vecs[i] = make([]float32, dim)
+		for j := range dim {
+			vecs[i][j] = float32(rng.NormFloat64())
+		}
+		ids[i] = []byte{byte(i >> 24), byte(i >> 16), byte(i >> 8), byte(i)}
+	}
+	return vecs, ids
+}
+
+func TestBuildAndSearchRecall(t *testing.T) {
+	const (
+		n   = 1000
+		dim = 64
+		k   = 10
+	)
+
+	db := newTestDB(t)
+	rng := rand.New(rand.NewPCG(42, 0))
+
+	vecs, ids := generateVecs(rng, n, dim)
+
+	cfg := DefaultConfig()
+	cfg.EfSearch = 128
+	cfg.CacheCapacity = 20000
+
+	idx, err := New(db, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+
+	iter := &sliceIterator{vecs: vecs, ids: ids}
+	if err := idx.Build(context.Background(), iter); err != nil {
+		t.Fatal(err)
+	}
+
+	if c := idx.Count(); c != n {
+		t.Fatalf("count = %d, want %d", c, n)
+	}
+
+	// Test recall@10 over multiple queries
+	numQueries := 50
+	totalRecall := 0.0
+	stride := n / numQueries
+
+	for q := range numQueries {
+		query := vecs[q*stride] // pick every stride-th vector as query
+
+		// Compute exact top-k
+		type idDist struct {
+			idx  int
+			dist float64
+		}
+		exactDists := make([]idDist, n)
+		for i, v := range vecs {
+			var d float64
+			for j := range dim {
+				diff := float64(query[j]) - float64(v[j])
+				d += diff * diff
+			}
+			exactDists[i] = idDist{i, d}
+		}
+		sort.Slice(exactDists, func(a, b int) bool {
+			return exactDists[a].dist < exactDists[b].dist
+		})
+
+		trueTopK := make(map[string]bool, k)
+		for i := range k {
+			id := ids[exactDists[i].idx]
+			trueTopK[string(id)] = true
+		}
+
+		// Search with the index
+		results, err := idx.Search(context.Background(), query, k)
+		if err != nil {
+			t.Fatalf("query %d: %v", q, err)
+		}
+
+		hits := 0
+		for _, r := range results {
+			if trueTopK[string(r.ID)] {
+				hits++
+			}
+		}
+		totalRecall += float64(hits) / float64(k)
+	}
+
+	avgRecall := totalRecall / float64(numQueries)
+	t.Logf("Average recall@%d over %d queries: %.2f%%", k, numQueries, avgRecall*100)
+	if avgRecall < 0.85 {
+		t.Errorf("recall@%d = %.2f%%, want >= 85%%", k, avgRecall*100)
+	}
+}
+
+func TestInsertAndFind(t *testing.T) {
+	const (
+		n       = 500
+		dim     = 64
+		nInsert = 200
+	)
+
+	db := newTestDB(t)
+	rng := rand.New(rand.NewPCG(42, 0))
+
+	vecs, ids := generateVecs(rng, n, dim)
+
+	cfg := DefaultConfig()
+	cfg.EfSearch = 128
+
+	idx, err := New(db, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+
+	iter := &sliceIterator{vecs: vecs, ids: ids}
+	if err := idx.Build(context.Background(), iter); err != nil {
+		t.Fatal(err)
+	}
+
+	// Generate and insert new vectors
+	insertVecs, insertIDs := generateVecs(rng, nInsert, dim)
+	// Use distinct IDs for inserts
+	for i := range insertIDs {
+		v := n + i
+		insertIDs[i] = []byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)}
+	}
+
+	if err := idx.Insert(context.Background(), insertVecs, insertIDs); err != nil {
+		t.Fatal(err)
+	}
+
+	if c := idx.Count(); c != n+nInsert {
+		t.Fatalf("count after insert = %d, want %d", c, n+nInsert)
+	}
+
+	// Search for the inserted vectors — they should be findable
+	found := 0
+	for i, vec := range insertVecs {
+		results, err := idx.Search(context.Background(), vec, 10)
+		if err != nil {
+			t.Fatalf("search for inserted vec %d: %v", i, err)
+		}
+		for _, r := range results {
+			if bytes.Equal(r.ID, insertIDs[i]) {
+				found++
+				break
+			}
+		}
+	}
+
+	findRate := float64(found) / float64(nInsert)
+	t.Logf("Find rate for inserted vectors: %.2f%% (%d/%d)", findRate*100, found, nInsert)
+	if findRate < 0.80 {
+		t.Errorf("find rate = %.2f%%, want >= 80%%", findRate*100)
+	}
+}
+
+func TestPersistenceRoundTrip(t *testing.T) {
+	const (
+		n   = 500
+		dim = 64
+	)
+
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "persist.db")
+
+	rng := rand.New(rand.NewPCG(42, 0))
+	vecs, ids := generateVecs(rng, n, dim)
+
+	cfg := DefaultConfig()
+	cfg.EfSearch = 64
+
+	// Build and close
+	{
+		db, err := sql.Open("sqlite", dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		idx, err := New(db, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		iter := &sliceIterator{vecs: vecs, ids: ids}
+		if err := idx.Build(context.Background(), iter); err != nil {
+			t.Fatal(err)
+		}
+
+		idx.Close()
+		db.Close()
+	}
+
+	// Reopen and search
+	{
+		db, err := sql.Open("sqlite", dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+
+		idx, err := New(db, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer idx.Close()
+
+		if c := idx.Count(); c != n {
+			t.Fatalf("count after reload = %d, want %d", c, n)
+		}
+
+		// Search should still work
+		results, err := idx.Search(context.Background(), vecs[0], 5)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(results) == 0 {
+			t.Fatal("no results after persistence round-trip")
+		}
+
+		// The query vector itself should be in the top results
+		foundSelf := false
+		for _, r := range results {
+			if bytes.Equal(r.ID, ids[0]) {
+				foundSelf = true
+				break
+			}
+		}
+		if !foundSelf {
+			t.Error("query vector not found in top-5 after persistence round-trip")
+		}
+	}
+}
+
+func TestConcurrentSearch(t *testing.T) {
+	const (
+		n   = 1000
+		dim = 64
+	)
+
+	db := newTestDB(t)
+	rng := rand.New(rand.NewPCG(42, 0))
+	vecs, ids := generateVecs(rng, n, dim)
+
+	cfg := DefaultConfig()
+	idx, err := New(db, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+
+	iter := &sliceIterator{vecs: vecs, ids: ids}
+	if err := idx.Build(context.Background(), iter); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run concurrent searches
+	const numGoroutines = 10
+	const queriesPerGoroutine = 20
+	var wg sync.WaitGroup
+	errors := make(chan error, numGoroutines*queriesPerGoroutine)
+
+	for g := range numGoroutines {
+		wg.Add(1)
+		go func(gid int) {
+			defer wg.Done()
+			for q := range queriesPerGoroutine {
+				queryIdx := (gid*queriesPerGoroutine + q) % n
+				results, err := idx.Search(context.Background(), vecs[queryIdx], 5)
+				if err != nil {
+					errors <- err
+					return
+				}
+				if len(results) == 0 {
+					errors <- fmt.Errorf("goroutine %d query %d: no results", gid, q)
+					return
+				}
+			}
+		}(g)
+	}
+
+	wg.Wait()
+	close(errors)
+
+	for err := range errors {
+		t.Error(err)
+	}
+}
+
+func TestInsertDuringRebuildNoDataLoss(t *testing.T) {
+	const (
+		n       = 400
+		dim     = 64
+		nInsert = 50
+	)
+
+	db := newTestDB(t)
+	rng := rand.New(rand.NewPCG(99, 0))
+
+	vecs, ids := generateVecs(rng, n, dim)
+
+	cfg := DefaultConfig()
+	cfg.EfSearch = 64
+	cfg.MaxDegree = 8 // fill neighbor lists faster to exercise reverse-edge pruning
+
+	idx, err := New(db, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+
+	iter := &sliceIterator{vecs: vecs, ids: ids}
+	if err := idx.Build(context.Background(), iter); err != nil {
+		t.Fatal(err)
+	}
+
+	insertVecs, insertIDs := generateVecs(rng, nInsert, dim)
+	for i := range insertIDs {
+		v := n + i
+		insertIDs[i] = []byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)}
+	}
+
+	var insertStarted sync.WaitGroup
+	insertStarted.Add(1)
+	var insertDone sync.WaitGroup
+	insertDone.Add(1)
+	idx.testDuringRebuildPersist = func() {
+		go func() {
+			defer insertDone.Done()
+			insertStarted.Done()
+			if err := idx.Insert(context.Background(), insertVecs, insertIDs); err != nil {
+				t.Errorf("concurrent insert: %v", err)
+			}
+		}()
+		insertStarted.Wait()
+	}
+
+	rebuildIter := &sliceIterator{vecs: vecs, ids: ids}
+	idx.RebuildAsync(context.Background(), rebuildIter)
+
+	insertDone.Wait()
+	idx.rebuildMu.Lock()
+	idx.rebuildMu.Unlock()
+
+	wantCount := n + nInsert
+	if c := idx.Count(); c != wantCount {
+		t.Fatalf("count = %d, want %d (nextID=%d)", c, wantCount, idx.nextID)
+	}
+	if idx.nextID != int64(wantCount) {
+		t.Fatalf("nextID = %d, want %d", idx.nextID, wantCount)
+	}
+
+	for i, id := range insertIDs {
+		var found int
+		err := db.QueryRow("SELECT 1 FROM vindex_nodes WHERE ext_id = ?", id).Scan(&found)
+		if err != nil {
+			t.Fatalf("inserted id %d missing from DB: %v", i, err)
+		}
+	}
+
+	for i, id := range ids {
+		var found int
+		err := db.QueryRow("SELECT 1 FROM vindex_nodes WHERE ext_id = ?", id).Scan(&found)
+		if err != nil {
+			t.Fatalf("rebuild id %d missing from DB: %v", i, err)
+		}
+	}
+}
+
+func TestNeedsRebuild(t *testing.T) {
+	const (
+		n   = 500
+		dim = 64
+	)
+
+	db := newTestDB(t)
+	rng := rand.New(rand.NewPCG(42, 0))
+	vecs, ids := generateVecs(rng, n, dim)
+
+	cfg := DefaultConfig()
+	cfg.InsertRatioThreshold = 0.30
+
+	idx, err := New(db, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+
+	iter := &sliceIterator{vecs: vecs, ids: ids}
+	if err := idx.Build(context.Background(), iter); err != nil {
+		t.Fatal(err)
+	}
+
+	if idx.NeedsRebuild() {
+		t.Error("should not need rebuild right after build")
+	}
+
+	// Insert 31% more vectors to trigger rebuild
+	nInsert := int(float64(n) * 0.31)
+	insertVecs, insertIDs := generateVecs(rng, nInsert, dim)
+	for i := range insertIDs {
+		v := n + i
+		insertIDs[i] = []byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)}
+	}
+	if err := idx.Insert(context.Background(), insertVecs, insertIDs); err != nil {
+		t.Fatal(err)
+	}
+
+	if !idx.NeedsRebuild() {
+		t.Error("should need rebuild after inserting 31% more vectors")
+	}
+}
+
+func TestSearchResultsValid(t *testing.T) {
+	const (
+		n   = 500
+		dim = 64
+	)
+
+	db := newTestDB(t)
+	rng := rand.New(rand.NewPCG(42, 0))
+	vecs, ids := generateVecs(rng, n, dim)
+
+	cfg := DefaultConfig()
+	cfg.BruteForceThreshold = 0 // force Vamana path
+	cfg.EfSearch = 64
+
+	idx, err := New(db, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+
+	iter := &sliceIterator{vecs: vecs, ids: ids}
+	if err := idx.Build(context.Background(), iter); err != nil {
+		t.Fatal(err)
+	}
+
+	for q := range 10 {
+		results, err := idx.Search(context.Background(), vecs[q*50], 10)
+		if err != nil {
+			t.Fatalf("query %d: %v", q, err)
+		}
+		for i, r := range results {
+			if r.ID == nil {
+				t.Errorf("query %d result %d has nil ID", q, i)
+			}
+			if r.Score < 0 {
+				t.Errorf("query %d result %d has negative score: %f", q, i, r.Score)
+			}
+		}
+		// Results must be sorted by score (ascending)
+		for i := 1; i < len(results); i++ {
+			if results[i].Score < results[i-1].Score {
+				t.Errorf("query %d: results not sorted at position %d: %f > %f",
+					q, i, results[i-1].Score, results[i].Score)
+			}
+		}
+	}
+}
+
+func TestInsertNeighborsConnected(t *testing.T) {
+	const (
+		n   = 300
+		dim = 64
+	)
+
+	db := newTestDB(t)
+	rng := rand.New(rand.NewPCG(42, 0))
+	vecs, ids := generateVecs(rng, n, dim)
+
+	cfg := DefaultConfig()
+	cfg.EfSearch = 64
+
+	idx, err := New(db, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+
+	iter := &sliceIterator{vecs: vecs, ids: ids}
+	if buildErr := idx.Build(context.Background(), iter); buildErr != nil {
+		t.Fatal(buildErr)
+	}
+
+	// Insert a new vector
+	insertVec := make([]float32, dim)
+	for j := range dim {
+		insertVec[j] = float32(rng.NormFloat64())
+	}
+	insertID := []byte{0xFF, 0xFF, 0xFF, 0x01}
+
+	if insertErr := idx.Insert(context.Background(), [][]float32{insertVec}, [][]byte{insertID}); insertErr != nil {
+		t.Fatal(insertErr)
+	}
+
+	// Verify the inserted node has neighbors in the DB
+	var neighborsBlob []byte
+	err = db.QueryRow("SELECT neighbors FROM vindex_nodes WHERE ext_id = ?", insertID).Scan(&neighborsBlob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	neighbors := deserializeInt64s(neighborsBlob)
+	if len(neighbors) == 0 {
+		t.Error("inserted node has no neighbors in the DB")
+	}
+
+	// Verify the inserted vector is findable
+	results, err := idx.Search(context.Background(), insertVec, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, r := range results {
+		if bytes.Equal(r.ID, insertID) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("inserted vector not found in top-5 results")
+	}
+}
+
+func TestEmptyIndex(t *testing.T) {
+	db := newTestDB(t)
+	cfg := DefaultConfig()
+
+	idx, err := New(db, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+
+	// Search on empty index
+	_, err = idx.Search(context.Background(), []float32{1, 2, 3}, 5)
+	if err == nil {
+		t.Error("expected error searching empty index")
+	}
+
+	// Count on empty index
+	if c := idx.Count(); c != 0 {
+		t.Errorf("count = %d, want 0", c)
+	}
+}
+
+func BenchmarkBuild10K(b *testing.B) {
+	const (
+		n   = 10000
+		dim = 128
+	)
+
+	rng := rand.New(rand.NewPCG(42, 0))
+	vecs, ids := generateVecs(rng, n, dim)
+
+	for b.Loop() {
+		dir, err := os.MkdirTemp("", "horosvec-bench-*")
+		if err != nil {
+			b.Fatal(err)
+		}
+		dbPath := filepath.Join(dir, "bench.db")
+		db, err := sql.Open("sqlite", dbPath)
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		cfg := DefaultConfig()
+		idx, err := New(db, cfg)
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		iter := &sliceIterator{vecs: vecs, ids: ids}
+		if err := idx.Build(context.Background(), iter); err != nil {
+			b.Fatal(err)
+		}
+
+		_ = idx.Close()
+		_ = db.Close()
+		os.RemoveAll(dir)
+	}
+}
+
+func BenchmarkSearch10K(b *testing.B) {
+	const (
+		n   = 10000
+		dim = 128
+	)
+
+	rng := rand.New(rand.NewPCG(42, 0))
+	vecs, ids := generateVecs(rng, n, dim)
+
+	dir, err := os.MkdirTemp("", "horosvec-bench-*")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	dbPath := filepath.Join(dir, "bench.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+
+	cfg := DefaultConfig()
+	cfg.CacheCapacity = 20000
+	idx, err := New(db, cfg)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer idx.Close()
+
+	iter := &sliceIterator{vecs: vecs, ids: ids}
+	if err := idx.Build(context.Background(), iter); err != nil {
+		b.Fatal(err)
+	}
+
+	query := vecs[0]
+
+	b.ResetTimer()
+	for b.Loop() {
+		_, _ = idx.Search(context.Background(), query, 10)
+	}
+}
