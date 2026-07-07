@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"sync"
 )
 
 const (
@@ -35,12 +36,16 @@ func codeDimFor(dim, rounds int) int {
 // Rotator applies randomized Hadamard rotation H·D per round.
 // rounds=0 is explicit identity: copy with optional zero-padding to codeDim.
 type Rotator struct {
-	dim        int
-	codeDim    int
-	rounds     int
-	seed       uint64
-	diagonals  [][]float32 // per-round ±1 diagonal, length codeDim
-	fhtScratch []float64   // reusable float64 buffer for numerically stable FHT
+	dim       int
+	codeDim   int
+	rounds    int
+	seed      uint64
+	diagonals [][]float32 // per-round ±1 diagonal, length codeDim
+	// scratchPool provides per-call float64 buffers for the numerically stable FHT.
+	// A pool (rather than a single shared field) makes Rotate reentrant and safe under
+	// concurrent Search: multiple goroutines share idx.rotator under RLock, and a shared
+	// scratch would be written concurrently (data race + corrupted rotated query).
+	scratchPool sync.Pool
 }
 
 // NewRotator creates a rotator. codeDim is derived from dim and rounds unless
@@ -59,7 +64,11 @@ func NewRotatorWithCodeDim(dim, codeDim, rounds int, seed uint64) *Rotator {
 		seed:    seed,
 	}
 	if rounds > 0 {
-		r.fhtScratch = make([]float64, codeDim)
+		cd := codeDim
+		r.scratchPool.New = func() any {
+			s := make([]float64, cd)
+			return &s
+		}
 		r.diagonals = make([][]float32, rounds)
 		for round := range rounds {
 			rng := rand.New(rand.NewPCG(seed, uint64(round)))
@@ -106,13 +115,17 @@ func (r *Rotator) Rotate(src []float32, dst []float32) {
 		return
 	}
 
+	// Per-call scratch from the pool: reentrant and concurrency-safe (see scratchPool).
+	sp := r.scratchPool.Get().(*[]float64)
+	scratch := *sp
 	for round := range r.rounds {
 		d := r.diagonals[round]
 		for i := range r.codeDim {
 			dst[i] *= d[i]
 		}
-		fhtInPlace(dst[:r.codeDim], r.fhtScratch)
+		fhtInPlace(dst[:r.codeDim], scratch)
 	}
+	r.scratchPool.Put(sp)
 }
 
 // fhtInPlace applies a normalized fast Walsh-Hadamard transform in place.
