@@ -136,7 +136,99 @@ func (idx *Index) ExportArena(path string) error {
 	return exportArenaFromDB(idx.db, idx.dim, path)
 }
 
-// exportArenaFromDB matérialise l'arène depuis vindex_nodes.
+// arenaWriter écrit une arène plate fp16 au fil de l'eau : header placeholder d'abord,
+// puis une ligne fp16 par vecteur (writeVec), puis finalize() réécrit le header avec le
+// count exact, fsync le tout et renomme atomiquement le fichier temporaire vers path.
+// Crash-consistance : le fichier final n'apparaît (rename atomique) qu'après un fsync
+// complet ; un crash avant finalize laisse seulement le .tmp (jamais renommé), et une
+// troncature externe est détectée à la relecture par la garde de longueur d'openArena
+// (header + count×dim×2). Un seul écrivain à la fois (arène append-only).
+type arenaWriter struct {
+	f      *os.File
+	tmp    string
+	path   string
+	dim    int
+	count  int64
+	rowBuf []byte
+}
+
+// newArenaWriter crée le fichier temporaire et réserve l'espace du header (réécrit à la
+// fin avec le count exact).
+func newArenaWriter(path string, dim int) (*arenaWriter, error) {
+	if dim <= 0 {
+		return nil, fmt.Errorf("horosvec: arena writer: invalid dim %d", dim)
+	}
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return nil, fmt.Errorf("horosvec: arena writer create: %w", err)
+	}
+	if _, err := f.Write(make([]byte, arenaHeaderSize)); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return nil, fmt.Errorf("horosvec: arena writer header: %w", err)
+	}
+	return &arenaWriter{f: f, tmp: tmp, path: path, dim: dim, rowBuf: make([]byte, dim*2)}, nil
+}
+
+// writeVec encode et append un vecteur fp32→fp16 dans l'ordre node_id (dense 0..count-1).
+func (w *arenaWriter) writeVec(vec []float32) error {
+	if len(vec) != w.dim {
+		return fmt.Errorf("horosvec: arena writer: vec dim %d != %d", len(vec), w.dim)
+	}
+	for i, v := range vec {
+		binary.LittleEndian.PutUint16(w.rowBuf[i*2:], float32ToFloat16(v))
+	}
+	if _, err := w.f.Write(w.rowBuf); err != nil {
+		return fmt.Errorf("horosvec: arena writer write: %w", err)
+	}
+	w.count++
+	return nil
+}
+
+// finalize réécrit le header avec le count exact, fsync et renomme atomiquement.
+func (w *arenaWriter) finalize() error {
+	if err := w.f.Sync(); err != nil {
+		w.abort()
+		return fmt.Errorf("horosvec: arena writer sync payload: %w", err)
+	}
+	if _, err := w.f.Seek(0, 0); err != nil {
+		w.abort()
+		return fmt.Errorf("horosvec: arena writer seek: %w", err)
+	}
+	header := make([]byte, arenaHeaderSize)
+	copy(header[0:8], arenaMagic)
+	binary.LittleEndian.PutUint32(header[8:], arenaVersion)
+	binary.LittleEndian.PutUint32(header[12:], uint32(w.dim))
+	binary.LittleEndian.PutUint64(header[16:], uint64(w.count))
+	if _, err := w.f.Write(header); err != nil {
+		w.abort()
+		return fmt.Errorf("horosvec: arena writer rewrite header: %w", err)
+	}
+	if err := w.f.Sync(); err != nil {
+		w.abort()
+		return fmt.Errorf("horosvec: arena writer sync header: %w", err)
+	}
+	if err := w.f.Close(); err != nil {
+		os.Remove(w.tmp)
+		return fmt.Errorf("horosvec: arena writer close: %w", err)
+	}
+	if err := os.Rename(w.tmp, w.path); err != nil {
+		os.Remove(w.tmp)
+		return fmt.Errorf("horosvec: arena writer rename: %w", err)
+	}
+	return nil
+}
+
+// abort ferme et supprime le fichier temporaire (aucun fichier final produit).
+func (w *arenaWriter) abort() {
+	w.f.Close()
+	os.Remove(w.tmp)
+}
+
+// exportArenaFromDB matérialise l'arène depuis vindex_nodes (chemin de rétro-compat : index
+// portant encore les blobs vecteur). Un index construit en streaming vector-less n'a plus de
+// blob et écrit son arène directement au build ; ExportArena n'y est pas requis.
 func exportArenaFromDB(db *sql.DB, dim int, path string) error {
 	rows, err := db.Query("SELECT node_id, vector FROM vindex_nodes ORDER BY node_id")
 	if err != nil {
@@ -144,83 +236,38 @@ func exportArenaFromDB(db *sql.DB, dim int, path string) error {
 	}
 	defer rows.Close()
 
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
+	w, err := newArenaWriter(path, dim)
 	if err != nil {
-		return fmt.Errorf("horosvec: export arena create: %w", err)
+		return err
 	}
-	// La charge utile est écrite ligne à ligne ; le header (qui porte le count final)
-	// est rembobiné et réécrit à la fin.
-	cleanup := func() {
-		f.Close()
-		os.Remove(tmp)
-	}
-
-	// Réserver l'espace du header (réécrit à la fin avec le count exact).
-	if _, err := f.Write(make([]byte, arenaHeaderSize)); err != nil {
-		cleanup()
-		return fmt.Errorf("horosvec: export arena header: %w", err)
-	}
-
-	rowBuf := make([]byte, dim*2)
-	var count int64
+	var pos int64
 	for rows.Next() {
 		var nodeID int64
 		var vecBlob []byte
 		if err := rows.Scan(&nodeID, &vecBlob); err != nil {
-			cleanup()
+			w.abort()
 			return fmt.Errorf("horosvec: export arena row: %w", err)
 		}
-		if nodeID != count {
-			cleanup()
-			return fmt.Errorf("horosvec: export arena non-sequential node_id %d at position %d", nodeID, count)
+		if nodeID != pos {
+			w.abort()
+			return fmt.Errorf("horosvec: export arena non-sequential node_id %d at position %d", nodeID, pos)
 		}
 		vec := deserializeFloat32s(vecBlob)
 		if len(vec) != dim {
-			cleanup()
+			w.abort()
 			return fmt.Errorf("horosvec: export arena node %d dim %d != %d", nodeID, len(vec), dim)
 		}
-		for i, v := range vec {
-			binary.LittleEndian.PutUint16(rowBuf[i*2:], float32ToFloat16(v))
+		if err := w.writeVec(vec); err != nil {
+			w.abort()
+			return err
 		}
-		if _, err := f.Write(rowBuf); err != nil {
-			cleanup()
-			return fmt.Errorf("horosvec: export arena write: %w", err)
-		}
-		count++
+		pos++
 	}
 	if err := rows.Err(); err != nil {
-		cleanup()
+		w.abort()
 		return fmt.Errorf("horosvec: export arena rows: %w", err)
 	}
-
-	// Réécrire le header avec le count exact.
-	if _, err := f.Seek(0, 0); err != nil {
-		cleanup()
-		return fmt.Errorf("horosvec: export arena seek: %w", err)
-	}
-	header := make([]byte, arenaHeaderSize)
-	copy(header[0:8], arenaMagic)
-	binary.LittleEndian.PutUint32(header[8:], arenaVersion)
-	binary.LittleEndian.PutUint32(header[12:], uint32(dim))
-	binary.LittleEndian.PutUint64(header[16:], uint64(count))
-	if _, err := f.Write(header); err != nil {
-		cleanup()
-		return fmt.Errorf("horosvec: export arena rewrite header: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		cleanup()
-		return fmt.Errorf("horosvec: export arena sync: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("horosvec: export arena close: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("horosvec: export arena rename: %w", err)
-	}
-	return nil
+	return w.finalize()
 }
 
 // openArena lit et valide un fichier d'arène fp16. Le header (magic, version, dim,

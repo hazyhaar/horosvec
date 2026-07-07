@@ -111,8 +111,26 @@ type rotationMeta struct {
 
 // saveGraph persists all nodes and metadata from a build.
 func saveGraph(tx *sql.Tx, nodes []graphNode, medoid int64, dim int, maxDegree int, centroid []float32, rot rotationMeta) error {
+	return saveGraphImpl(tx, nodes, medoid, dim, maxDegree, centroid, rot, false)
+}
+
+// saveGraphNoVec persiste le graphe sans le blob vecteur (SQLite allégé du streaming
+// vector-less) : node_id/ext_id/neighbors/quantized/normes + méta, mais un blob vecteur
+// VIDE. La source des vecteurs bruts au rerank et à l'export devient l'arène fp16. Le plan
+// chaud (buildHotPlane) ne lit jamais `vector`, donc reste intact. Un index EXISTANT
+// portant des blobs reste lisible (loadNode fonctionne, blob non vide) — la lecture est
+// rétro-compatible.
+func saveGraphNoVec(tx *sql.Tx, nodes []graphNode, medoid int64, dim int, maxDegree int, centroid []float32, rot rotationMeta) error {
+	return saveGraphImpl(tx, nodes, medoid, dim, maxDegree, centroid, rot, true)
+}
+
+func saveGraphImpl(tx *sql.Tx, nodes []graphNode, medoid int64, dim int, maxDegree int, centroid []float32, rot rotationMeta, omitVec bool) error {
 	for _, n := range nodes {
-		if err := saveNode(tx, n.id, n.extID, n.neighbors, n.vec, n.code, n.sqNorm, n.l1Norm); err != nil {
+		vec := n.vec
+		if omitVec {
+			vec = nil // blob vecteur vide : la colonne BLOB NOT NULL accepte une longueur 0
+		}
+		if err := saveNode(tx, n.id, n.extID, n.neighbors, vec, n.code, n.sqNorm, n.l1Norm); err != nil {
 			return fmt.Errorf("save node %d: %w", n.id, err)
 		}
 	}
