@@ -15,7 +15,7 @@ import (
 //
 //   offset  size  field
 //   0       4     magic "HVEC"
-//   4       1     version (0x01)
+//   4       1     version (0x01 legacy, 0x02 with rotation meta)
 //   5       1     flags (bit0 vectors present, bit1 quantized present)
 //   6       2     dim (uint16)
 //   8       2     max_degree (uint16)
@@ -44,8 +44,13 @@ import (
 //   N     value
 
 var (
-	binaryMagic   = [4]byte{'H', 'V', 'E', 'C'}
-	binaryVersion = uint8(0x01)
+	binaryMagic       = [4]byte{'H', 'V', 'E', 'C'}
+	binaryVersion     = uint8(0x02)
+	binaryVersionV1   = uint8(0x01)
+	supportedVersions = map[uint8]struct{}{
+		binaryVersionV1: {},
+		binaryVersion:   {},
+	}
 )
 
 const (
@@ -320,8 +325,8 @@ func ImportBinary(r io.Reader) (*Index, error) {
 	if err != nil {
 		return nil, fmt.Errorf("horosvec: read version: %w", err)
 	}
-	if version != binaryVersion {
-		return nil, fmt.Errorf("%w: got 0x%02x want 0x%02x", ErrBadVersion, version, binaryVersion)
+	if _, ok := supportedVersions[version]; !ok {
+		return nil, fmt.Errorf("%w: got 0x%02x", ErrBadVersion, version)
 	}
 	flags, err := br.ReadByte()
 	if err != nil {
@@ -513,9 +518,33 @@ func ImportBinary(r io.Reader) (*Index, error) {
 		idx.standaloneMetaKeys = append(idx.standaloneMetaKeys, key)
 	}
 
-	// Set up encoder from centroid meta if present, otherwise zero centroid.
-	centroid := make([]float32, int(dim))
-	if cb, ok := idx.standaloneMeta["centroid"]; ok && len(cb) == int(dim)*4 {
+	// Rotation meta: v1 exports omit keys → identity rotation, codeDim=dim.
+	rotRounds := 0
+	rotSeed := uint64(0)
+	codeDim := int(dim)
+	if version >= binaryVersion {
+		if b, ok := idx.standaloneMeta["rotation_rounds"]; ok {
+			rotRounds = int(deserializeInt64(b))
+		}
+		if b, ok := idx.standaloneMeta["rotation_seed"]; ok {
+			rotSeed = uint64(deserializeInt64(b))
+		}
+		if b, ok := idx.standaloneMeta["code_dim"]; ok {
+			codeDim = int(deserializeInt64(b))
+		}
+	}
+	if err := validateRotationMeta(int(dim), codeDim, rotRounds); err != nil {
+		return nil, err
+	}
+	idx.codeDim = codeDim
+	idx.rotator = NewRotatorWithCodeDim(int(dim), codeDim, rotRounds, rotSeed)
+
+	// Centroid lives in rotated/padded space; length must match codeDim.
+	centroid := make([]float32, codeDim)
+	if cb, ok := idx.standaloneMeta["centroid"]; ok {
+		if len(cb) != codeDim*4 {
+			return nil, fmt.Errorf("horosvec: centroid length %d != code_dim*4 (%d)", len(cb), codeDim*4)
+		}
 		centroid = deserializeFloat32s(cb)
 	}
 	idx.encoder = NewEncoder(centroid)
