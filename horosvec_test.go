@@ -396,15 +396,19 @@ func TestInsertDuringRebuildNoDataLoss(t *testing.T) {
 	idx.RebuildAsync(context.Background(), rebuildIter)
 
 	insertDone.Wait()
+	// Barrier: acquiring rebuildMu waits for the async rebuild to finish;
+	// the state is read under the lock so the section is not empty (SA2001).
 	idx.rebuildMu.Lock()
+	gotCount := idx.Count()
+	gotNextID := idx.nextID
 	idx.rebuildMu.Unlock()
 
 	wantCount := n + nInsert
-	if c := idx.Count(); c != wantCount {
-		t.Fatalf("count = %d, want %d (nextID=%d)", c, wantCount, idx.nextID)
+	if gotCount != wantCount {
+		t.Fatalf("count = %d, want %d (nextID=%d)", gotCount, wantCount, gotNextID)
 	}
-	if idx.nextID != int64(wantCount) {
-		t.Fatalf("nextID = %d, want %d", idx.nextID, wantCount)
+	if gotNextID != int64(wantCount) {
+		t.Fatalf("nextID = %d, want %d", gotNextID, wantCount)
 	}
 
 	for i, id := range insertIDs {
