@@ -21,6 +21,9 @@ type searchState struct {
 
 	// Pre-allocated query centering buffer (reused across queries).
 	queryCentered []float64
+
+	// Pre-allocated RaBitQ fastscan LUT ((dim+7)/8 * 256 entries).
+	lut []float64
 }
 
 var searchPool = sync.Pool{
@@ -74,6 +77,14 @@ func (s *searchState) reset(maxNodes int64, beamWidth int, dim int) {
 		s.queryCentered = make([]float64, dim)
 	} else {
 		s.queryCentered = s.queryCentered[:dim]
+	}
+
+	// Reset RaBitQ LUT buffer
+	lutSize := (dim + 7) / 8 * 256
+	if cap(s.lut) < lutSize {
+		s.lut = make([]float64, lutSize)
+	} else {
+		s.lut = s.lut[:lutSize]
 	}
 }
 

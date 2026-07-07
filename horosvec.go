@@ -497,6 +497,7 @@ func (idx *Index) rabitqGreedySearchInternal(ctx context.Context, query []float3
 		state.queryCentered[i] = c
 		querySqNorm += c * c
 	}
+	buildRabitqLUT(state.queryCentered, state.lut)
 
 	medoidNode, err := loadFn(idx.medoid)
 	if err != nil {
@@ -504,7 +505,7 @@ func (idx *Index) rabitqGreedySearchInternal(ctx context.Context, query []float3
 	}
 	state.visit(idx.medoid)
 
-	startDist := rabitqDistanceAsymPrecomp(state.queryCentered, querySqNorm, medoidNode.code, medoidNode.sqNorm, medoidNode.l1Norm)
+	startDist := rabitqDistanceLUT(state.lut, querySqNorm, medoidNode.code, medoidNode.sqNorm, medoidNode.l1Norm)
 
 	state.pushHeap(searchCandidate{nodeID: idx.medoid, dist: startDist})
 	state.insertBest(searchCandidate{nodeID: idx.medoid, dist: startDist}, beamWidth)
@@ -539,7 +540,7 @@ func (idx *Index) rabitqGreedySearchInternal(ctx context.Context, query []float3
 				continue
 			}
 
-			d := rabitqDistanceAsymPrecomp(state.queryCentered, querySqNorm, nbrNode.code, nbrNode.sqNorm, nbrNode.l1Norm)
+			d := rabitqDistanceLUT(state.lut, querySqNorm, nbrNode.code, nbrNode.sqNorm, nbrNode.l1Norm)
 
 			if len(state.best) < beamWidth || d < worstBest {
 				state.pushHeap(searchCandidate{nodeID: nbr, dist: d})
