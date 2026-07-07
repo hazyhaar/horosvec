@@ -405,14 +405,22 @@ func (idx *Index) bruteForceSQLite(ctx context.Context, query []float32, topK in
 // vamanaSearch does 2-stage RaBitQ beam search + L2 rerank.
 // Called under RLock. loadNodeReadOnly fallback to loadNode may promote cache entry (LRU side effect under read path).
 func (idx *Index) vamanaSearch(ctx context.Context, query []float32, topK int) ([]Result, error) {
-	// Determine beam width: wide enough for re-ranking
+	// Beam width is the user's speed/recall knob; it must at least feed the
+	// rerank floor (3*topK) but is NEVER inflated to RerankTopN — the old
+	// coupling (efSearch = max(efSearch, rerankN=500)) silently floored every
+	// beam below 500, making EfSearch decorative across its useful range
+	// (found on the SIFT bench: identical recall and QPS from ef=64 to 512).
+	// Rerank adapts to the beam, not the other way around.
+	efSearch := idx.cfg.EfSearch
+	if efSearch < topK*3 {
+		efSearch = topK * 3
+	}
 	rerankN := idx.cfg.RerankTopN
 	if rerankN < topK*3 {
 		rerankN = topK * 3
 	}
-	efSearch := idx.cfg.EfSearch
-	if efSearch < rerankN {
-		efSearch = rerankN
+	if rerankN > efSearch {
+		rerankN = efSearch
 	}
 
 	// Stage 1: RaBitQ beam search (approximate distances)
