@@ -5,6 +5,9 @@ import (
 	"context"
 	"math"
 	"math/rand/v2"
+	"runtime"
+	"sync"
+	"sync/atomic"
 )
 
 // graphNode represents a node in the Vamana graph during construction.
@@ -255,10 +258,85 @@ func sortCandidates(candidates []searchCandidate) {
 	}
 }
 
+const graphMutexShards = 256
+
+type graphShardMutexes struct {
+	shards [graphMutexShards]sync.Mutex
+}
+
+func (g *graphShardMutexes) lock(id int64) {
+	g.shards[id&(graphMutexShards-1)].Lock()
+}
+
+func (g *graphShardMutexes) unlock(id int64) {
+	g.shards[id&(graphMutexShards-1)].Unlock()
+}
+
+// initRandomNeighbors seeds each node with random neighbors using a deterministic PCG RNG.
+// Returns neighbor slices pre-drawn sequentially for deterministic consumption.
+func initRandomNeighbors(rng *rand.Rand, nodes []graphNode, maxDegree int) {
+	n := len(nodes)
+	nNeighbors := maxDegree
+	if nNeighbors > n-1 {
+		nNeighbors = n - 1
+	}
+	if nNeighbors <= 0 {
+		return
+	}
+
+	pool := make([]int64, n)
+	for i := range n {
+		pool[i] = int64(i)
+	}
+	pickBuf := make([]int, nNeighbors)
+
+	for i := range n {
+		node := &nodes[i]
+		if len(node.neighbors) > 0 {
+			continue
+		}
+		myIdx := int(node.id)
+		pool[myIdx], pool[n-1] = pool[n-1], pool[myIdx]
+
+		node.neighbors = make([]int64, nNeighbors)
+		for j := range nNeighbors {
+			ri := rng.IntN(n - 1 - j)
+			node.neighbors[j] = pool[ri]
+			pickBuf[j] = ri
+			pool[ri], pool[n-2-j] = pool[n-2-j], pool[ri]
+		}
+
+		for j := nNeighbors - 1; j >= 0; j-- {
+			ri := pickBuf[j]
+			pool[ri], pool[n-2-j] = pool[n-2-j], pool[ri]
+		}
+		pool[myIdx], pool[n-1] = pool[n-1], pool[myIdx]
+	}
+}
+
+// shuffleOrders pre-draws a random visit order for each pass (sequential PCG).
+func shuffleOrders(rng *rand.Rand, n, passes int) [][]int {
+	orders := make([][]int, passes)
+	order := make([]int, n)
+	for i := range n {
+		order[i] = i
+	}
+	for pass := range passes {
+		perm := make([]int, n)
+		copy(perm, order)
+		for i := n - 1; i > 0; i-- {
+			j := rng.IntN(i + 1)
+			perm[i], perm[j] = perm[j], perm[i]
+		}
+		orders[pass] = perm
+	}
+	return orders
+}
+
 // buildGraph builds a Vamana graph from the given nodes.
 // Nodes must have sequential IDs 0..len(nodes)-1 for slice-based access.
-// It performs the specified number of passes, each time iterating over all nodes
-// in random order, doing greedy search + robust prune.
+// buildWorkers==1 uses the legacy sequential path (bit-identical determinism).
+// buildWorkers>1 parallelizes each pass; interleaving is non-deterministic but quality-equivalent.
 func buildGraph(
 	ctx context.Context,
 	nodes []graphNode,
@@ -267,13 +345,33 @@ func buildGraph(
 	beamWidth int,
 	alpha float64,
 	passes int,
-) {
-	n := len(nodes)
-	if n == 0 {
-		return
+	buildWorkers int,
+) error {
+	if len(nodes) == 0 {
+		return nil
 	}
+	workers := buildWorkers
+	if workers == 0 {
+		workers = runtime.GOMAXPROCS(0)
+	}
+	if workers == 1 {
+		return buildGraphSequential(ctx, nodes, medoid, maxDegree, beamWidth, alpha, passes)
+	}
+	return buildGraphParallel(ctx, nodes, medoid, maxDegree, beamWidth, alpha, passes, workers)
+}
 
-	// Slice-based access for O(1) lookup (nodes have IDs 0..n-1)
+// buildGraphSequential is the legacy single-threaded Vamana build (BuildWorkers=1).
+func buildGraphSequential(
+	ctx context.Context,
+	nodes []graphNode,
+	medoid int64,
+	maxDegree int,
+	beamWidth int,
+	alpha float64,
+	passes int,
+) error {
+	n := len(nodes)
+
 	getVec := func(id int64) []float32 {
 		if id >= 0 && int(id) < n {
 			return nodes[id].vec
@@ -287,50 +385,9 @@ func buildGraph(
 		return nil
 	}
 
-	rng := rand.New(rand.NewPCG(42, 0)) // deterministic seed for reproducible graph builds
+	rng := rand.New(rand.NewPCG(42, 0))
+	initRandomNeighbors(rng, nodes, maxDegree)
 
-	// Initialize with random neighbors using Fisher-Yates partial shuffle
-	nNeighbors := maxDegree
-	if nNeighbors > n-1 {
-		nNeighbors = n - 1
-	}
-	// Reusable buffers for sampling random neighbors.
-	pool := make([]int64, n)
-	for i := range n {
-		pool[i] = int64(i)
-	}
-	pickBuf := make([]int, nNeighbors) // records swap indices for O(nNeighbors) restore
-	for i := range n {
-		node := &nodes[i]
-		if len(node.neighbors) > 0 {
-			continue
-		}
-		// Partial Fisher-Yates: swap node.id to the end, then pick nNeighbors from the rest
-		// First, swap this node's ID to the end to exclude it
-		myIdx := int(node.id)
-		pool[myIdx], pool[n-1] = pool[n-1], pool[myIdx]
-
-		// Pick nNeighbors from pool[0..n-2], recording each draw index.
-		node.neighbors = make([]int64, nNeighbors)
-		for j := range nNeighbors {
-			ri := rng.IntN(n - 1 - j)
-			node.neighbors[j] = pool[ri]
-			pickBuf[j] = ri
-			pool[ri], pool[n-2-j] = pool[n-2-j], pool[ri]
-		}
-
-		// Restore pool to the identity permutation in O(nNeighbors): undo the
-		// sampling swaps in reverse order, then undo the initial myIdx swap.
-		// Same random draws as before, so graph output is unchanged, but the
-		// former per-node full re-init made build O(n^2).
-		for j := nNeighbors - 1; j >= 0; j-- {
-			ri := pickBuf[j]
-			pool[ri], pool[n-2-j] = pool[n-2-j], pool[ri]
-		}
-		pool[myIdx], pool[n-1] = pool[n-1], pool[myIdx]
-	}
-
-	// Build order buffer (reused across passes)
 	order := make([]int, n)
 	for i := range n {
 		order[i] = i
@@ -338,27 +395,24 @@ func buildGraph(
 
 	for pass := range passes {
 		_ = pass
-		if ctx.Err() != nil {
-			return
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 
-		// Fisher-Yates shuffle of order
 		for i := n - 1; i > 0; i-- {
 			j := rng.IntN(i + 1)
 			order[i], order[j] = order[j], order[i]
 		}
 
 		for _, oi := range order {
-			if ctx.Err() != nil {
-				return
+			if err := ctx.Err(); err != nil {
+				return err
 			}
 
 			node := &nodes[oi]
 
-			// Greedy search from medoid to this node's vector
 			candidates, _ := greedySearch(node.vec, medoid, beamWidth, getVec, getNeighbors)
 
-			// Add current neighbors to candidate set
 			for _, nbr := range node.neighbors {
 				nbrVec := getVec(nbr)
 				if nbrVec != nil {
@@ -367,11 +421,9 @@ func buildGraph(
 				}
 			}
 
-			// Robust prune to select new neighbors
 			newNeighbors := robustPrune(node.id, candidates, alpha, maxDegree, getVec)
 			node.neighbors = newNeighbors
 
-			// Add reverse edges (simplified: just append, don't prune unless over 2*maxDegree)
 			for _, nbr := range newNeighbors {
 				if nbr < 0 || int(nbr) >= n {
 					continue
@@ -386,7 +438,6 @@ func buildGraph(
 				}
 				if !found {
 					nbrNode.neighbors = append(nbrNode.neighbors, node.id)
-					// Only prune if well over capacity (2*maxDegree threshold avoids constant re-pruning)
 					if len(nbrNode.neighbors) > 2*maxDegree {
 						cands := make([]searchCandidate, len(nbrNode.neighbors))
 						for ci, nn := range nbrNode.neighbors {
@@ -405,7 +456,6 @@ func buildGraph(
 		}
 	}
 
-	// Final pass: prune any over-capacity neighborhoods
 	for i := range nodes {
 		if len(nodes[i].neighbors) > maxDegree {
 			node := &nodes[i]
@@ -422,4 +472,211 @@ func buildGraph(
 			node.neighbors = robustPrune(node.id, cands, alpha, maxDegree, getVec)
 		}
 	}
+	return nil
+}
+
+// buildGraphParallel parallelizes each Vamana pass with a worker pool.
+// Neighbor slices are replaced atomically (never mutated in-place) for race-free reads during greedySearch.
+func buildGraphParallel(
+	ctx context.Context,
+	nodes []graphNode,
+	medoid int64,
+	maxDegree int,
+	beamWidth int,
+	alpha float64,
+	passes int,
+	workers int,
+) error {
+	n := len(nodes)
+
+	rng := rand.New(rand.NewPCG(42, 0))
+	initRandomNeighbors(rng, nodes, maxDegree)
+	orders := shuffleOrders(rng, n, passes)
+
+	neighborStore := make([]atomic.Pointer[[]int64], n)
+	for i := range n {
+		stored := append([]int64(nil), nodes[i].neighbors...)
+		neighborStore[i].Store(&stored)
+	}
+
+	getVec := func(id int64) []float32 {
+		if id >= 0 && int(id) < n {
+			return nodes[id].vec
+		}
+		return nil
+	}
+	getNeighbors := func(id int64) []int64 {
+		if id < 0 || int(id) >= n {
+			return nil
+		}
+		p := neighborStore[id].Load()
+		if p == nil {
+			return nil
+		}
+		return *p
+	}
+	setNeighbors := func(id int64, nb []int64) {
+		stored := append([]int64(nil), nb...)
+		neighborStore[id].Store(&stored)
+	}
+
+	var locks graphShardMutexes
+
+	processNode := func(oi int) {
+		node := &nodes[oi]
+
+		candidates, _ := greedySearch(node.vec, medoid, beamWidth, getVec, getNeighbors)
+
+		for _, nbr := range getNeighbors(node.id) {
+			nbrVec := getVec(nbr)
+			if nbrVec != nil {
+				d := l2DistanceSquared(node.vec, nbrVec)
+				candidates = append(candidates, searchCandidate{nodeID: nbr, dist: d})
+			}
+		}
+
+		newNeighbors := robustPrune(node.id, candidates, alpha, maxDegree, getVec)
+		locks.lock(node.id)
+		setNeighbors(node.id, newNeighbors)
+		locks.unlock(node.id)
+
+		for _, nbr := range newNeighbors {
+			if nbr < 0 || int(nbr) >= n {
+				continue
+			}
+			locks.lock(nbr)
+			cur := getNeighbors(nbr)
+			found := false
+			for _, nn := range cur {
+				if nn == node.id {
+					found = true
+					break
+				}
+			}
+			if !found {
+				updated := append(append([]int64(nil), cur...), node.id)
+				if len(updated) > 2*maxDegree {
+					cands := make([]searchCandidate, len(updated))
+					for ci, nn := range updated {
+						nnVec := getVec(nn)
+						if nnVec != nil {
+							cands[ci] = searchCandidate{
+								nodeID: nn,
+								dist:   l2DistanceSquared(nodes[nbr].vec, nnVec),
+							}
+						}
+					}
+					updated = robustPrune(nbr, cands, alpha, maxDegree, getVec)
+				}
+				setNeighbors(nbr, updated)
+			}
+			locks.unlock(nbr)
+		}
+	}
+
+	runPass := func(order []int) error {
+		var wg sync.WaitGroup
+		var firstErr atomic.Pointer[error]
+		batchSize := (n + workers - 1) / workers
+		for batchStart := 0; batchStart < n; batchStart += batchSize {
+			if firstErr.Load() != nil {
+				break
+			}
+			if err := ctx.Err(); err != nil {
+				firstErr.Store(&err)
+				break
+			}
+			batchEnd := batchStart + batchSize
+			if batchEnd > n {
+				batchEnd = n
+			}
+			wg.Add(1)
+			go func(start, end int) {
+				defer wg.Done()
+				for bi := start; bi < end; bi++ {
+					if firstErr.Load() != nil {
+						return
+					}
+					if err := ctx.Err(); err != nil {
+						firstErr.CompareAndSwap(nil, &err)
+						return
+					}
+					processNode(order[bi])
+				}
+			}(batchStart, batchEnd)
+		}
+		wg.Wait()
+		if err := firstErr.Load(); err != nil {
+			return *err
+		}
+		return ctx.Err()
+	}
+
+	for pass := range passes {
+		_ = pass
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := runPass(orders[pass]); err != nil {
+			return err
+		}
+	}
+
+	// Final pass: prune over-capacity neighborhoods (parallel).
+	var wg sync.WaitGroup
+	var firstErr atomic.Pointer[error]
+	batchSize := (n + workers - 1) / workers
+	for batchStart := 0; batchStart < n; batchStart += batchSize {
+		if firstErr.Load() != nil {
+			break
+		}
+		if err := ctx.Err(); err != nil {
+			firstErr.Store(&err)
+			break
+		}
+		batchEnd := batchStart + batchSize
+		if batchEnd > n {
+			batchEnd = n
+		}
+		wg.Add(1)
+		go func(start, end int) {
+			defer wg.Done()
+			for i := start; i < end; i++ {
+				if firstErr.Load() != nil {
+					return
+				}
+				if err := ctx.Err(); err != nil {
+					firstErr.CompareAndSwap(nil, &err)
+					return
+				}
+				if len(getNeighbors(int64(i))) <= maxDegree {
+					continue
+				}
+				cur := getNeighbors(int64(i))
+				cands := make([]searchCandidate, len(cur))
+				for ci, nn := range cur {
+					nnVec := getVec(nn)
+					if nnVec != nil {
+						cands[ci] = searchCandidate{
+							nodeID: nn,
+							dist:   l2DistanceSquared(nodes[i].vec, nnVec),
+						}
+					}
+				}
+				setNeighbors(int64(i), robustPrune(int64(i), cands, alpha, maxDegree, getVec))
+			}
+		}(batchStart, batchEnd)
+	}
+	wg.Wait()
+	if err := firstErr.Load(); err != nil {
+		return *err
+	}
+
+	for i := range n {
+		p := neighborStore[i].Load()
+		if p != nil {
+			nodes[i].neighbors = *p
+		}
+	}
+	return ctx.Err()
 }

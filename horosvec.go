@@ -8,6 +8,7 @@ import (
 	"math"
 	"runtime"
 	"sync"
+	"sync/atomic"
 
 	_ "modernc.org/sqlite"
 )
@@ -39,6 +40,122 @@ type Config struct {
 	RotationRounds int
 	// RotationSeed: PCG seed for diagonal signs. 0 means defaultRotationSeed (42).
 	RotationSeed uint64
+
+	// BuildWorkers controls parallel Vamana graph construction.
+	// 0 (default) uses ~40% of the CPU capacity available to the process
+	// (runtime.GOMAXPROCS(0), which is cgroup-aware since Go 1.25) — horosvec is
+	// an embedded library and must not starve its host application during a
+	// build; claim more explicitly (e.g. runtime.GOMAXPROCS(0)) for dedicated
+	// offline builds. 1 forces the legacy sequential path (bit-identical PCG
+	// draws and graph). Parallel builds (BuildWorkers != 1) are not bit-for-bit
+	// deterministic due to interleaving order; graph quality is equivalent
+	// (standard DiskANN). Use BuildWorkers=1 when exact reproducibility is required.
+	BuildWorkers int
+}
+
+// effectiveBuildWorkers resolves Config.BuildWorkers: 1 = sequential legacy,
+// 0 = polite default (~40% of available CPU capacity, min 1).
+func effectiveBuildWorkers(cfg Config) int {
+	if cfg.BuildWorkers == 1 {
+		return 1
+	}
+	if cfg.BuildWorkers > 1 {
+		return cfg.BuildWorkers
+	}
+	w := (runtime.GOMAXPROCS(0)*4 + 9) / 10 // ceil(40%)
+	if w < 1 {
+		w = 1
+	}
+	return w
+}
+
+// encodeGraphNodes rotates and RaBitQ-encodes vectors into graph nodes.
+// workers<=1 uses the sequential path; workers>1 parallelizes by contiguous batches.
+func encodeGraphNodes(
+	ctx context.Context,
+	rotator *Rotator,
+	encoder *Encoder,
+	allVecs [][]float32,
+	allIDs [][]byte,
+	workers int,
+) ([]graphNode, error) {
+	n := len(allVecs)
+	nodes := make([]graphNode, n)
+	if workers <= 1 {
+		rotated := make([]float32, rotator.CodeDim())
+		for i, v := range allVecs {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			rotator.Rotate(v, rotated)
+			code, sqNorm, l1Norm := encoder.Encode(rotated)
+			nodes[i] = graphNode{
+				id:     int64(i),
+				extID:  allIDs[i],
+				vec:    v,
+				code:   code,
+				sqNorm: sqNorm,
+				l1Norm: l1Norm,
+			}
+		}
+		return nodes, nil
+	}
+
+	// Rotator reuses fhtScratch; clone one rotator per worker for thread safety.
+	workerRotators := make([]*Rotator, workers)
+	for i := range workers {
+		workerRotators[i] = NewRotatorWithCodeDim(
+			rotator.Dim(), rotator.CodeDim(), rotator.Rounds(), rotator.Seed(),
+		)
+	}
+
+	var wg sync.WaitGroup
+	var firstErr atomic.Pointer[error]
+	batchSize := (n + workers - 1) / workers
+	workerIdx := 0
+	for batchStart := 0; batchStart < n; batchStart += batchSize {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		batchEnd := batchStart + batchSize
+		if batchEnd > n {
+			batchEnd = n
+		}
+		wRot := workerRotators[workerIdx]
+		workerIdx++
+		wg.Add(1)
+		go func(start, end int, wr *Rotator) {
+			defer wg.Done()
+			rotated := make([]float32, wr.CodeDim())
+			for i := start; i < end; i++ {
+				if firstErr.Load() != nil {
+					return
+				}
+				if err := ctx.Err(); err != nil {
+					firstErr.CompareAndSwap(nil, &err)
+					return
+				}
+				wr.Rotate(allVecs[i], rotated)
+				code, sqNorm, l1Norm := encoder.Encode(rotated)
+				nodes[i] = graphNode{
+					id:     int64(i),
+					extID:  allIDs[i],
+					vec:    allVecs[i],
+					code:   code,
+					sqNorm: sqNorm,
+					l1Norm: l1Norm,
+				}
+			}
+		}(batchStart, batchEnd, wRot)
+	}
+	wg.Wait()
+	if err := firstErr.Load(); err != nil {
+		return nil, *err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return nodes, nil
 }
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -260,26 +377,15 @@ func (idx *Index) Build(ctx context.Context, iter VectorIterator) error {
 	idx.centroid.AddBatch(allVecs)
 	idx.centroid.SnapshotBuild()
 
-	// Create graph nodes with RaBitQ codes (encoded in rotated/padded space)
-	nodes := make([]graphNode, len(allVecs))
-	for i, v := range allVecs {
-		idx.rotator.Rotate(v, rotated)
-		code, sqNorm, l1Norm := idx.encoder.Encode(rotated)
-		nodes[i] = graphNode{
-			id:     int64(i),
-			extID:  allIDs[i],
-			vec:    v,
-			code:   code,
-			sqNorm: sqNorm,
-			l1Norm: l1Norm,
-		}
+	buildWorkers := effectiveBuildWorkers(idx.cfg)
+	nodes, err := encodeGraphNodes(ctx, idx.rotator, idx.encoder, allVecs, allIDs, buildWorkers)
+	if err != nil {
+		return err
 	}
 
 	idx.medoid = findMedoid(nodes)
-	buildGraph(ctx, nodes, idx.medoid, idx.cfg.MaxDegree, idx.cfg.SearchListSize, idx.cfg.Alpha, idx.cfg.BuildPasses)
-
-	if ctx.Err() != nil {
-		return ctx.Err()
+	if err := buildGraph(ctx, nodes, idx.medoid, idx.cfg.MaxDegree, idx.cfg.SearchListSize, idx.cfg.Alpha, idx.cfg.BuildPasses, buildWorkers); err != nil {
+		return err
 	}
 
 	// Persist
@@ -1021,24 +1127,14 @@ func (idx *Index) rebuildInternal(ctx context.Context, iter VectorIterator) {
 
 	enc := NewEncoder(centroid)
 
-	nodes := make([]graphNode, len(allVecs))
-	for i, v := range allVecs {
-		idx.rotator.Rotate(v, rotated)
-		code, sqNorm, l1Norm := enc.Encode(rotated)
-		nodes[i] = graphNode{
-			id:     int64(i),
-			extID:  allIDs[i],
-			vec:    v,
-			code:   code,
-			sqNorm: sqNorm,
-			l1Norm: l1Norm,
-		}
+	buildWorkers := effectiveBuildWorkers(idx.cfg)
+	nodes, err := encodeGraphNodes(ctx, idx.rotator, enc, allVecs, allIDs, buildWorkers)
+	if err != nil {
+		return
 	}
 
 	medoid := findMedoid(nodes)
-	buildGraph(ctx, nodes, medoid, idx.cfg.MaxDegree, idx.cfg.SearchListSize, idx.cfg.Alpha, idx.cfg.BuildPasses)
-
-	if ctx.Err() != nil {
+	if err := buildGraph(ctx, nodes, medoid, idx.cfg.MaxDegree, idx.cfg.SearchListSize, idx.cfg.Alpha, idx.cfg.BuildPasses, buildWorkers); err != nil {
 		return
 	}
 
