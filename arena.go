@@ -226,6 +226,58 @@ func (w *arenaWriter) abort() {
 	os.Remove(w.tmp)
 }
 
+// sync force l'écriture sur disque du payload courant (fsync) sans réécrire le header ni
+// renommer. Sert de point de durabilité pour un checkpoint : après un sync réussi, tous les
+// vecteurs déjà passés à writeVec sont durables dans le .tmp. Le header reste placeholder
+// jusqu'à finalize ; la reprise (resumeArenaWriter) tronque au count durci par le manifest.
+func (w *arenaWriter) sync() error {
+	if err := w.f.Sync(); err != nil {
+		return fmt.Errorf("horosvec: arena writer sync: %w", err)
+	}
+	return nil
+}
+
+// resumeArenaWriter rouvre le fichier temporaire d'une arène en cours (path+".tmp") pour
+// reprendre l'écriture après une interruption. Tout octet au-delà de count×dim×2 (écriture
+// partielle post-checkpoint jamais confirmée au manifest) est tronqué, et le curseur est
+// positionné en append au rang count. Le count fourni provient du checkpoint durable du
+// manifest ; la garantie de non-doublon/non-trou repose sur cet appariement.
+func resumeArenaWriter(path string, dim int, count int64) (*arenaWriter, error) {
+	if dim <= 0 {
+		return nil, fmt.Errorf("horosvec: arena writer resume: invalid dim %d", dim)
+	}
+	if count < 0 {
+		return nil, fmt.Errorf("horosvec: arena writer resume: invalid count %d", count)
+	}
+	if count > (int64(1)<<62)/(int64(dim)*2) {
+		return nil, fmt.Errorf("horosvec: arena writer resume: count %d too large for dim %d", count, dim)
+	}
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("horosvec: arena writer resume open: %w", err)
+	}
+	want := int64(arenaHeaderSize) + count*int64(dim)*2
+	st, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("horosvec: arena writer resume stat: %w", err)
+	}
+	if st.Size() < want {
+		f.Close()
+		return nil, fmt.Errorf("horosvec: arena writer resume: file size %d shorter than checkpoint %d", st.Size(), want)
+	}
+	if err := f.Truncate(want); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("horosvec: arena writer resume truncate: %w", err)
+	}
+	if _, err := f.Seek(want, 0); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("horosvec: arena writer resume seek: %w", err)
+	}
+	return &arenaWriter{f: f, tmp: tmp, path: path, dim: dim, count: count, rowBuf: make([]byte, dim*2)}, nil
+}
+
 // exportArenaFromDB matérialise l'arène depuis vindex_nodes (chemin de rétro-compat : index
 // portant encore les blobs vecteur). Un index construit en streaming vector-less n'a plus de
 // blob et écrit son arène directement au build ; ExportArena n'y est pas requis.
