@@ -96,6 +96,52 @@ func rabitqDistanceAsymPrecomp(queryCentered []float64, querySqNorm float64, sto
 	return querySqNorm + storedSqNorm - 2.0*storedSqNorm*signDot/storedL1Norm
 }
 
+// buildRabitqLUT precomputes per-byte lookup tables for fastscan distance evaluation.
+// lut must have length (dim+7)/8 * 256. For each byte position b and pattern p (0..255),
+// lut[b*256+p] is the signDot contribution of dimensions [b*8, min(b*8+8, dim)).
+func buildRabitqLUT(queryCentered []float64, lut []float64) {
+	dim := len(queryCentered)
+	nBytes := (dim + 7) / 8
+	for b := range nBytes {
+		start := b * 8
+		end := start + 8
+		if end > dim {
+			end = dim
+		}
+		base := b * 256
+
+		var negSum float64
+		for i := start; i < end; i++ {
+			negSum -= queryCentered[i]
+		}
+		lut[base] = negSum
+
+		for p := 1; p < 256; p++ {
+			prev := p & (p - 1)
+			j := bits.TrailingZeros(uint(p))
+			if start+j < end {
+				lut[base+p] = lut[base+prev] + 2*queryCentered[start+j]
+			} else {
+				lut[base+p] = lut[base+prev]
+			}
+		}
+	}
+}
+
+// rabitqDistanceLUT evaluates asymmetric RaBitQ distance using a precomputed LUT.
+func rabitqDistanceLUT(lut []float64, querySqNorm float64, storedCode []byte, storedSqNorm float64, storedL1Norm float64) float64 {
+	if storedL1Norm == 0 {
+		return storedSqNorm
+	}
+
+	var signDot float64
+	for b, code := range storedCode {
+		signDot += lut[b*256+int(code)]
+	}
+
+	return querySqNorm + storedSqNorm - 2.0*storedSqNorm*signDot/storedL1Norm
+}
+
 // rabitqDistance computes symmetric distance between two RaBitQ codes.
 // Uses POPCOUNT on uint64 blocks for speed. Useful for benchmarking.
 func rabitqDistance(queryCode []byte, storedCode []byte, querySqNorm float64, storedSqNorm float64) float64 {
