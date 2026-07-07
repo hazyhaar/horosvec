@@ -31,7 +31,7 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -39,7 +39,10 @@ jobs:
           go-version: "1.26"
       - run: go mod download
       - run: CGO_ENABLED=0 go build ./...
-      - run: go test -race -v -count=1 -timeout 120s ./...
+      # The suite includes deterministic recall benches (~20s without -race);
+      # the race detector multiplies that several-fold — 120s was the old
+      # prototype's budget and times out on the real suite.
+      - run: go test -race -v -count=1 -timeout 900s ./...
 
   ci-ok:
     name: CI OK
