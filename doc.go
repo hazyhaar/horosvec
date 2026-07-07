@@ -68,4 +68,16 @@
 //     graph path and budget memory accordingly.
 //   - PRAGMA tuning applies per pooled connection; see pragma.go if you
 //     manage the *sql.DB pool yourself.
+//
+// # Performance and GC at scale
+//
+// The hot search path reads RaBitQ codes, norms, neighbor lists and ext_ids
+// from a pointer-free flat arena (hotPlane) indexed by node_id arithmetic,
+// avoiding per-neighbor map lookups on the greedy loop. Raw float32 vectors
+// are not duplicated in the arena (rerank still uses flatVecs or SQL). At
+// 10M×dim128 the arena is ~3 GiB of []byte/[]float64/[]int32 slices that the
+// GC scans in O(1). After Build and after an async rebuild swap, the index
+// calls runtime.GC() once to collect construction garbage during a cold,
+// deterministic window rather than during queries. For very large indexes,
+// set GOMEMLIMIT to cap heap growth and reduce GC assist pressure on Search.
 package horosvec
