@@ -60,7 +60,7 @@ graceful-degradation behaviour of `SearchWithRerank`.
 
 ## Status
 
-v0.1.0 — extracted from the [horos55](https://hazyhaar.fr) ecosystem, where it
+v0.2.0 — extracted from the [horos55](https://hazyhaar.fr) ecosystem, where it
 serves RAG shard search and code-map embeddings in production. Coverage 85.9 %,
 41 tests including commit-failure injection, corrupt-blob hardening, LRU
 eviction, drift-triggered rebuilds and cancellation mid-search.

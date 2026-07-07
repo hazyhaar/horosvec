@@ -54,7 +54,7 @@
 // (recall_measure_test.go, recall_real_test.go). They are measurements, not
 // guarantees; scale beyond ~10^4 vectors is not covered by them.
 //
-// # Known limits (v0.1)
+// # Known limits (v0.2)
 //
 //   - SearchWithRerank degrades gracefully when the reranker callback fails:
 //     it returns the approximate candidates truncated to topK with a nil
