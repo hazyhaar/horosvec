@@ -563,6 +563,12 @@ func ImportBinary(r io.Reader) (*Index, error) {
 		idx.flatIDs = flatIDs
 	}
 
+	if numNodes > 0 {
+		if err := idx.rebuildPlaneLocked(); err != nil {
+			return nil, fmt.Errorf("horosvec: build hot plane on import: %w", err)
+		}
+	}
+
 	return idx, nil
 }
 

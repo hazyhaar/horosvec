@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"runtime"
 	"sync"
 
 	_ "modernc.org/sqlite"
@@ -106,6 +107,10 @@ type Index struct {
 	// preserved for round-trip ExportBinary. Insertion order kept via standaloneMetaKeys.
 	standaloneMeta     map[string][]byte
 	standaloneMetaKeys []string
+
+	// plan chaud : arènes plates pointer-free pour la boucle greedy (fiche 1 hnswlib).
+	plane      *hotPlane
+	planePatch map[int32][]int32 // overlay voisinages re-câblés depuis dernier buildHotPlane
 }
 
 // New creates or loads an Index from the given database.
@@ -159,6 +164,10 @@ func New(db *sql.DB, cfg Config) (*Index, error) {
 		// Load flat vectors for brute-force search
 		if nodeCount <= cfg.BruteForceThreshold {
 			idx.loadFlatVectors()
+		}
+
+		if err := idx.rebuildPlaneLocked(); err != nil {
+			return nil, fmt.Errorf("horosvec: build hot plane on load: %w", err)
 		}
 	}
 
@@ -327,6 +336,13 @@ func (idx *Index) Build(ctx context.Context, iter VectorIterator) error {
 		idx.flatIDs[i] = allIDs[i]
 	}
 
+	if err := idx.rebuildPlaneLocked(); err != nil {
+		return fmt.Errorf("horosvec: build hot plane: %w", err)
+	}
+	// Payer la collecte des déchets de construction au moment froid et déterministe,
+	// jamais pendant les requêtes.
+	runtime.GC()
+
 	return nil
 }
 
@@ -480,18 +496,22 @@ func (idx *Index) vamanaSearch(ctx context.Context, query []float32, topK int) (
 		candidates = candidates[:topK]
 	}
 
-	// Resolve ext_ids from cache (no SQL per result, read-only cache access)
+	// Resolve ext_ids from hot plane when covered, else cache/SQL.
 	results := make([]Result, 0, len(candidates))
 	for _, c := range candidates {
 		if err := ctx.Err(); err != nil {
 			return nil, fmt.Errorf("horosvec: %w", err)
 		}
-		node, err := loadNodeReadOnly(ctx, idx.db, idx.cache, c.nodeID)
-		if err != nil || node.extID == nil {
-			continue
+		var extID []byte
+		if extID = idx.planeExtID(c.nodeID); extID == nil {
+			node, err := loadNodeReadOnly(ctx, idx.db, idx.cache, c.nodeID)
+			if err != nil || node.extID == nil {
+				continue
+			}
+			extID = node.extID
 		}
-		idCopy := make([]byte, len(node.extID))
-		copy(idCopy, node.extID)
+		idCopy := make([]byte, len(extID))
+		copy(idCopy, extID)
 		results = append(results, Result{ID: idCopy, Score: c.dist})
 	}
 
@@ -520,11 +540,6 @@ func (idx *Index) rabitqGreedySearch(ctx context.Context, query []float32, beamW
 // When loadFn is nil, committed nodes are loaded via loadNodeReadOnly.
 // Acquires searchState from sync.Pool. If panic before defer release, state leaked. Pool may return dirty state from previous query.
 func (idx *Index) rabitqGreedySearchInternal(ctx context.Context, query []float32, beamWidth int, maxNodes int64, loadFn func(int64) (*cachedNode, error)) ([]searchCandidate, error) {
-	if loadFn == nil {
-		loadFn = func(id int64) (*cachedNode, error) {
-			return loadNodeReadOnly(ctx, idx.db, idx.cache, id)
-		}
-	}
 	state := acquireSearchState(maxNodes, beamWidth, idx.codeDim)
 	defer releaseSearchState(state)
 
@@ -538,13 +553,13 @@ func (idx *Index) rabitqGreedySearchInternal(ctx context.Context, query []float3
 	}
 	buildRabitqLUT(state.queryCentered, state.lut)
 
-	medoidNode, err := loadFn(idx.medoid)
+	medoidCode, medoidSq, medoidL1, err := idx.greedyNodeCodeNorms(ctx, idx.medoid, loadFn)
 	if err != nil {
 		return nil, nil
 	}
 	state.visit(idx.medoid)
 
-	startDist := rabitqDistanceLUT(state.lut, querySqNorm, medoidNode.code, medoidNode.sqNorm, medoidNode.l1Norm)
+	startDist := rabitqDistanceLUT(state.lut, querySqNorm, medoidCode, medoidSq, medoidL1)
 
 	state.pushHeap(searchCandidate{nodeID: idx.medoid, dist: startDist})
 	state.insertBest(searchCandidate{nodeID: idx.medoid, dist: startDist}, beamWidth)
@@ -564,28 +579,26 @@ func (idx *Index) rabitqGreedySearchInternal(ctx context.Context, query []float3
 			break
 		}
 
-		curNode, err := loadFn(cur.nodeID)
-		if err != nil {
-			continue
-		}
-
-		for _, nbr := range curNode.neighbors {
+		if err := idx.greedyEachNeighbor(ctx, cur.nodeID, loadFn, func(nbr int64) bool {
 			if !state.visit(nbr) {
-				continue
+				return true
 			}
 
-			nbrNode, err := loadFn(nbr)
+			nbrCode, nbrSq, nbrL1, err := idx.greedyNodeCodeNorms(ctx, nbr, loadFn)
 			if err != nil {
-				continue
+				return true
 			}
 
-			d := rabitqDistanceLUT(state.lut, querySqNorm, nbrNode.code, nbrNode.sqNorm, nbrNode.l1Norm)
+			d := rabitqDistanceLUT(state.lut, querySqNorm, nbrCode, nbrSq, nbrL1)
 
 			if len(state.best) < beamWidth || d < worstBest {
 				state.pushHeap(searchCandidate{nodeID: nbr, dist: d})
 				state.insertBest(searchCandidate{nodeID: nbr, dist: d}, beamWidth)
 				worstBest = state.worstBestDist()
 			}
+			return true
+		}); err != nil {
+			continue
 		}
 	}
 
@@ -701,6 +714,7 @@ func (idx *Index) Insert(ctx context.Context, vecs [][]float32, ids [][]byte) er
 	defer func() { _ = tx.Rollback() }()
 
 	next := idx.nextID
+	insertedOrder := make([]int64, 0, len(vecs))
 	pendingNodes := make(map[int64]*cachedNode, len(vecs))
 	pendingNeighbors := make(map[int64][]int64)
 	var pendingFlatVecs []float32
@@ -729,6 +743,7 @@ func (idx *Index) Insert(ctx context.Context, vecs [][]float32, ids [][]byte) er
 		}
 		nodeID := next
 		next++
+		insertedOrder = append(insertedOrder, nodeID)
 
 		queryRotated := make([]float32, idx.codeDim)
 		idx.rotator.Rotate(vec, queryRotated)
@@ -877,6 +892,7 @@ func (idx *Index) Insert(ctx context.Context, vecs [][]float32, ids [][]byte) er
 	for _, vec := range pendingCentroidVecs {
 		idx.centroid.Add(vec)
 	}
+	idx.extendPlaneAfterInsert(insertedOrder, pendingNodes, pendingNeighbors)
 
 	idx.insertedSinceMedoid += int64(len(vecs))
 
@@ -1082,6 +1098,14 @@ func (idx *Index) rebuildInternal(ctx context.Context, iter VectorIterator) {
 
 	idx.cache.clear()
 	warmCache(ctx, idx.db, idx.cache, medoid, 2)
+
+	if err := idx.rebuildPlaneLocked(); err != nil {
+		slog.Error("horosvec: rebuild hot plane failed", "err", err)
+		return
+	}
+	// Payer la collecte des déchets de construction au moment froid et déterministe,
+	// jamais pendant les requêtes.
+	runtime.GC()
 }
 
 // Count returns the number of vectors in the index.
