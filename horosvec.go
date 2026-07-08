@@ -1253,6 +1253,18 @@ func (idx *Index) NeedsRebuild() bool {
 // The rebuild runs in a background goroutine protected by rebuildMu.
 // Panics are recovered to prevent deadlock on rebuildMu.
 func (idx *Index) RebuildAsync(ctx context.Context, iter VectorIterator) {
+	// Mode arène (SQLite vector-less) : rebuildInternal matérialiserait tous les vecteurs et
+	// réécrirait des blobs dans vindex_nodes/vindex_meta, détruisant le mode arène (l'arène
+	// fp16 figée devient incohérente avec les nouveaux blobs). Refus fail-loud AVANT le
+	// lancement de la goroutine, symétrique du garde d'Insert : un index arène se reconstruit
+	// par Build, il ne se rebuild pas en place.
+	idx.mu.RLock()
+	isArena := idx.arena != nil
+	idx.mu.RUnlock()
+	if isArena {
+		slog.Error("horosvec: RebuildAsync refused on an arena-backed index; rebuild via Build instead")
+		return
+	}
 	idx.rebuildMu.Lock()
 	go func() {
 		defer idx.rebuildMu.Unlock()
@@ -1275,6 +1287,12 @@ func (idx *Index) rebuildInternal(ctx context.Context, iter VectorIterator) {
 	// correction prime sur la latence (rebuild reste asynchrone côté appelant).
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
+	// Garde interne défensif, symétrique du refus dans RebuildAsync : un index arène ne doit
+	// jamais atteindre le chemin de réécriture des blobs SQLite (perte du mode vector-less).
+	if idx.arena != nil {
+		slog.Error("horosvec: rebuildInternal aborted on an arena-backed index")
+		return
+	}
 	var allVecs [][]float32
 	var allIDs [][]byte
 	for {
