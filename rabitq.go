@@ -69,9 +69,17 @@ func rabitqDistanceAsym(query []float32, centroid []float32, storedCode []byte, 
 		}
 	}
 
-	// RaBitQ corrected distance estimate:
-	// <ô, q̂> ≈ signDot * ||o'|| / (||q'|| * L1_o)
-	// dist² = ||o'||² + ||q'||² - 2 * ||o'||² * signDot / L1_o
+	// Estimateur RaBitQ asymétrique du produit scalaire centré ⟨o', q'⟩ (o' = vecteur stocké
+	// centré, q' = requête centrée). Notons ō = sign(o')/√d le code 1-bit normalisé, et ‖q_r‖
+	// la norme de la requête centrée.
+	//   ⟨ō, q'⟩ = signDot / (√d · ‖q_r‖) · ‖q_r‖ = signDot / √d   (signDot = Σ sign(o'_i)·q'_i)
+	//   ⟨ō, o'⟩ = L1 / √d            (L1 = Σ |o'_i|, la norme L1 du stocké centré)
+	// L'estimateur non biaisé du papier est ⟨o', q'⟩ ≈ ⟨ō, q'⟩ / ⟨ō, o'⟩ · ‖o'‖², soit
+	//   ⟨o', q'⟩ ≈ (signDot / √d) / (L1 / √d) · ‖o'‖² = signDot · ‖o'‖² / L1.
+	// Les √d se simplifient et ‖q_r‖ n'intervient pas (la requête n'est pas quantifiée dans la
+	// voie asymétrique) ; la division par L1 EST le facteur de correction ⟨ō, o⟩ du papier.
+	// D'où la distance carrée : dist² = ‖o'‖² + ‖q_r‖² - 2·⟨o', q'⟩
+	//                                 = storedSqNorm + querySqNorm - 2·storedSqNorm·signDot / L1.
 	dist := querySqNorm + storedSqNorm - 2.0*storedSqNorm*signDot/storedL1Norm
 	return dist
 }
@@ -144,6 +152,12 @@ func rabitqDistanceLUT(lut []float64, querySqNorm float64, storedCode []byte, st
 
 // rabitqDistance computes symmetric distance between two RaBitQ codes.
 // Uses POPCOUNT on uint64 blocks for speed. Useful for benchmarking.
+//
+// ATTENTION : ce n'est PAS l'estimateur RaBitQ utilisé par la recherche. La voie de
+// production est asymétrique (requête non quantifiée, cf. rabitqDistanceAsym/LUT) ; cette
+// variante symétrique quantifie les DEUX vecteurs et estime un cosinus par accord de bits
+// (Hamming), au prix d'un biais supérieur. Elle n'existe que pour le banc de comparaison,
+// jamais sur le chemin chaud.
 func rabitqDistance(queryCode []byte, storedCode []byte, querySqNorm float64, storedSqNorm float64) float64 {
 	totalBits := len(queryCode) * 8
 
