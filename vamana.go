@@ -359,10 +359,89 @@ func (g *graphShardMutexes) unlock(id int64) {
 	g.shards[id&(graphMutexShards-1)].Unlock()
 }
 
-// initRandomNeighbors seeds each node with random neighbors using a deterministic PCG RNG.
-// Returns neighbor slices pre-drawn sequentially for deterministic consumption.
-func initRandomNeighbors(rng *rand.Rand, nodes []graphNode, maxDegree int) {
-	n := len(nodes)
+// flatNeighborStore porte l'adjacence de CONSTRUCTION en arène plate : un unique []int32
+// global de capacité n×stride, indexé par node_id, plus un compteur de degré par nœud —
+// à la place des tranches []int64 par nœud du build historique (en-têtes de slice, arrondis
+// d'allocateur, pointeurs scannés par le GC, et churn d'allocation à chaque échange de
+// voisinage). C'est le patron d'arène plate de hotPlane reproduit côté build. int32 (au lieu
+// d'int64) suffit : les node_id de construction sont denses 0..n-1 avec n < 2^31.
+//
+// Sûreté concurrente : contrairement au build parallèle antérieur (échange lock-free d'un
+// pointeur de slice immuable), une arène plate mutable ne peut offrir de lecture cohérente
+// sans verrou. Toute lecture ET toute écriture d'un voisinage passent donc par le mutex
+// shardé du nœud (locks != nil en parallèle ; nil en séquentiel, aucun verrou). loadInto
+// copie les voisins dans un tampon détenu par l'appelant : la valeur rendue reste valide
+// après unlock (c'est une copie, jamais un aliasing de nbrs).
+type flatNeighborStore struct {
+	n      int
+	stride int
+	nbrs   []int32
+	deg    []int32
+	locks  *graphShardMutexes // nil => chemin séquentiel, aucun verrou
+}
+
+// newFlatNeighborStore alloue l'arène plate. stride = 2*maxDegree+1 couvre le débordement
+// transitoire du build : un voisinage retour croît d'une arête à la fois et n'est re-élagué
+// que lorsqu'il dépasse 2*maxDegree (sémantique identique au build antérieur), atteignant au
+// pire 2*maxDegree+1 avant élagage. parallel==true arme les verrous shardés.
+func newFlatNeighborStore(n, maxDegree int, parallel bool) *flatNeighborStore {
+	stride := 2*maxDegree + 1
+	s := &flatNeighborStore{
+		n:      n,
+		stride: stride,
+		nbrs:   make([]int32, n*stride),
+		deg:    make([]int32, n),
+	}
+	if parallel {
+		s.locks = &graphShardMutexes{}
+	}
+	return s
+}
+
+func (s *flatNeighborStore) lock(id int64) {
+	if s.locks != nil {
+		s.locks.lock(id)
+	}
+}
+
+func (s *flatNeighborStore) unlock(id int64) {
+	if s.locks != nil {
+		s.locks.unlock(id)
+	}
+}
+
+func (s *flatNeighborStore) degree(id int64) int { return int(s.deg[id]) }
+
+// loadInto ajoute les voisins du nœud id à dst (typiquement dst[:0], détenu par l'appelant)
+// et renvoie la slice remplie. L'appelant DOIT détenir lock(id) sur le chemin parallèle.
+func (s *flatNeighborStore) loadInto(id int64, dst []int64) []int64 {
+	base := int(id) * s.stride
+	d := int(s.deg[id])
+	for i := 0; i < d; i++ {
+		dst = append(dst, int64(s.nbrs[base+i]))
+	}
+	return dst
+}
+
+// set remplace le voisinage du nœud id (au plus stride entrées). L'appelant DOIT détenir
+// lock(id) sur le chemin parallèle. Les valeurs sont supposées < 2^31 (node_id denses).
+func (s *flatNeighborStore) set(id int64, nbrs []int64) {
+	base := int(id) * s.stride
+	d := len(nbrs)
+	if d > s.stride {
+		d = s.stride
+	}
+	for i := 0; i < d; i++ {
+		s.nbrs[base+i] = int32(nbrs[i])
+	}
+	s.deg[id] = int32(d)
+}
+
+// initRandomNeighborsStore ensemence chaque nœud de voisins aléatoires via un PCG
+// déterministe, en écrivant dans l'arène plate. La séquence de tirage (mêmes IntN dans le
+// même ordre) est conçue pour rester déterministe et reproductible d'un build à l'autre.
+// nid == i (node_id denses 0..n-1).
+func initRandomNeighborsStore(rng *rand.Rand, store *flatNeighborStore, n, maxDegree int) {
 	nNeighbors := maxDegree
 	if nNeighbors > n-1 {
 		nNeighbors = n - 1
@@ -376,22 +455,22 @@ func initRandomNeighbors(rng *rand.Rand, nodes []graphNode, maxDegree int) {
 		pool[i] = int64(i)
 	}
 	pickBuf := make([]int, nNeighbors)
+	drawn := make([]int64, nNeighbors)
 
 	for i := range n {
-		node := &nodes[i]
-		if len(node.neighbors) > 0 {
+		if store.degree(int64(i)) > 0 {
 			continue
 		}
-		myIdx := int(node.id)
+		myIdx := i
 		pool[myIdx], pool[n-1] = pool[n-1], pool[myIdx]
 
-		node.neighbors = make([]int64, nNeighbors)
 		for j := range nNeighbors {
 			ri := rng.IntN(n - 1 - j)
-			node.neighbors[j] = pool[ri]
+			drawn[j] = pool[ri]
 			pickBuf[j] = ri
 			pool[ri], pool[n-2-j] = pool[n-2-j], pool[ri]
 		}
+		store.set(int64(i), drawn)
 
 		for j := nNeighbors - 1; j >= 0; j-- {
 			ri := pickBuf[j]
@@ -420,10 +499,11 @@ func shuffleOrders(rng *rand.Rand, n, passes int) [][]int {
 	return orders
 }
 
-// buildGraph builds a Vamana graph from the given nodes.
-// Nodes must have sequential IDs 0..len(nodes)-1 for slice-based access.
-// buildWorkers==1 uses the legacy sequential path (bit-identical determinism).
-// buildWorkers>1 parallelizes each pass; interleaving is non-deterministic but quality-equivalent.
+// buildGraph builds a Vamana graph from the given nodes (chemin en mémoire legacy).
+// Nodes must have sequential IDs 0..len(nodes)-1. buildWorkers==1 uses the legacy sequential
+// path (bit-identical determinism) ; buildWorkers>1 parallelizes each pass. L'adjacence est
+// construite dans une arène plate ; à la fin, nodes[i].neighbors est renseigné depuis le store
+// pour que la persistance legacy (saveGraph, blob vecteur inclus) reste strictement inchangée.
 func buildGraph(
 	ctx context.Context,
 	nodes []graphNode,
@@ -437,17 +517,26 @@ func buildGraph(
 	if len(nodes) == 0 {
 		return nil
 	}
-	// Chemin en mémoire : les vecteurs sont les slices stables des graphNode (zéro copie),
-	// comportement legacy strictement inchangé. Le chemin arène passe par buildGraphSource.
-	return buildGraphSource(ctx, nodes, &memVecSource{nodes: nodes}, medoid, maxDegree, beamWidth, alpha, passes, buildWorkers)
+	// Chemin en mémoire : les vecteurs sont les slices stables des graphNode (zéro copie).
+	store, err := buildGraphStore(ctx, len(nodes), &memVecSource{nodes: nodes}, medoid, maxDegree, beamWidth, alpha, passes, buildWorkers)
+	if err != nil {
+		return err
+	}
+	buf := make([]int64, 0, store.stride)
+	for i := range nodes {
+		nodes[i].neighbors = append([]int64(nil), store.loadInto(int64(i), buf[:0])...)
+	}
+	return nil
 }
 
-// buildGraphSource construit le graphe Vamana en lisant les vecteurs via vs (mémoire ou
-// arène). Les voisinages sont portés par nodes[i].neighbors ; vs ne fournit que les
-// vecteurs. buildWorkers==1 emprunte le chemin séquentiel déterministe.
-func buildGraphSource(
+// buildGraphStore construit le graphe Vamana dans une arène plate d'adjacence
+// (flatNeighborStore), en lisant les vecteurs via vs (mémoire ou arène). Renvoie le store —
+// l'appelant en extrait les voisinages (legacy : recopie dans les graphNode ; arène :
+// persistance streaming directe). Aucune tranche de voisins par nœud n'est matérialisée
+// pendant la construction. buildWorkers==1 emprunte le chemin séquentiel déterministe.
+func buildGraphStore(
 	ctx context.Context,
-	nodes []graphNode,
+	n int,
 	vs vecSource,
 	medoid int64,
 	maxDegree int,
@@ -455,42 +544,50 @@ func buildGraphSource(
 	alpha float64,
 	passes int,
 	buildWorkers int,
-) error {
-	if len(nodes) == 0 {
-		return nil
+) (*flatNeighborStore, error) {
+	if n == 0 {
+		return newFlatNeighborStore(0, maxDegree, false), nil
 	}
 	workers := buildWorkers
 	if workers == 0 {
 		workers = runtime.GOMAXPROCS(0)
 	}
 	if workers == 1 {
-		return buildGraphSequential(ctx, nodes, vs, medoid, maxDegree, beamWidth, alpha, passes)
+		return buildGraphSequentialStore(ctx, n, vs, medoid, maxDegree, beamWidth, alpha, passes)
 	}
-	return buildGraphParallel(ctx, nodes, vs, medoid, maxDegree, beamWidth, alpha, passes, workers)
+	return buildGraphParallelStore(ctx, n, vs, medoid, maxDegree, beamWidth, alpha, passes, workers)
 }
 
-// buildGraphSequential is the legacy single-threaded Vamana build (BuildWorkers=1).
-func buildGraphSequential(
+// buildGraphSequentialStore : build Vamana séquentiel (BuildWorkers=1), déterministe et
+// reproductible (mêmes tirages PCG, même ordre de candidats d'un build à l'autre).
+// L'adjacence vit dans l'arène plate (store), aucun verrou.
+func buildGraphSequentialStore(
 	ctx context.Context,
-	nodes []graphNode,
+	n int,
 	vs vecSource,
 	medoid int64,
 	maxDegree int,
 	beamWidth int,
 	alpha float64,
 	passes int,
-) error {
-	n := len(nodes)
-
-	getNeighbors := func(id int64) []int64 {
-		if id >= 0 && int(id) < n {
-			return nodes[id].neighbors
-		}
-		return nil
-	}
+) (*flatNeighborStore, error) {
+	store := newFlatNeighborStore(n, maxDegree, false)
 
 	rng := rand.New(rand.NewPCG(42, 0))
-	initRandomNeighbors(rng, nodes, maxDegree)
+	initRandomNeighborsStore(rng, store, n, maxDegree)
+
+	// nbrBuf sert les lectures de greedySearch et de la boucle candidats ; rmwBuf sert la
+	// lecture-modification-écriture des arêtes retour. Deux tampons distincts : leurs usages
+	// ne se chevauchent jamais dans le temps (cap = stride, aucune réallocation).
+	nbrBuf := make([]int64, 0, store.stride)
+	rmwBuf := make([]int64, 0, store.stride)
+	finalBuf := make([]int64, 0, store.stride)
+	getNeighbors := func(id int64) []int64 {
+		if id < 0 || int(id) >= n {
+			return nil
+		}
+		return store.loadInto(id, nbrBuf[:0])
+	}
 
 	order := make([]int, n)
 	for i := range n {
@@ -500,7 +597,7 @@ func buildGraphSequential(
 	for pass := range passes {
 		_ = pass
 		if err := ctx.Err(); err != nil {
-			return err
+			return nil, err
 		}
 
 		for i := n - 1; i > 0; i-- {
@@ -510,15 +607,14 @@ func buildGraphSequential(
 
 		for _, oi := range order {
 			if err := ctx.Err(); err != nil {
-				return err
+				return nil, err
 			}
-
-			node := &nodes[oi]
-			selfVec := vs.vec(node.id, slotSelf)
+			nid := int64(oi)
+			selfVec := vs.vec(nid, slotSelf)
 
 			candidates, _ := greedySearch(selfVec, medoid, beamWidth, vs, getNeighbors)
 
-			for _, nbr := range node.neighbors {
+			for _, nbr := range getNeighbors(nid) {
 				nbrVec := vs.vec(nbr, slotProbe)
 				if nbrVec != nil {
 					d := l2DistanceSquared(selfVec, nbrVec)
@@ -526,70 +622,69 @@ func buildGraphSequential(
 				}
 			}
 
-			newNeighbors := robustPrune(node.id, candidates, alpha, maxDegree, vs)
-			node.neighbors = newNeighbors
+			newNeighbors := robustPrune(nid, candidates, alpha, maxDegree, vs)
+			store.set(nid, newNeighbors)
 
 			for _, nbr := range newNeighbors {
 				if nbr < 0 || int(nbr) >= n {
 					continue
 				}
-				nbrNode := &nodes[nbr]
+				cur := store.loadInto(nbr, rmwBuf[:0])
 				found := false
-				for _, nn := range nbrNode.neighbors {
-					if nn == node.id {
+				for _, nn := range cur {
+					if nn == nid {
 						found = true
 						break
 					}
 				}
-				if !found {
-					nbrNode.neighbors = append(nbrNode.neighbors, node.id)
-					if len(nbrNode.neighbors) > 2*maxDegree {
-						// nbrVecB (slotBest) tenu pendant toute la boucle ; nnVec (slotProbe)
-						// transitoire. robustPrune(nbr) réécrit ensuite ces slots, mais cands
-						// est déjà matérialisé (distances calculées).
-						nbrVecB := vs.vec(nbr, slotBest)
-						cands := make([]searchCandidate, len(nbrNode.neighbors))
-						for ci, nn := range nbrNode.neighbors {
-							nnVec := vs.vec(nn, slotProbe)
-							if nnVec != nil {
-								cands[ci] = searchCandidate{
-									nodeID: nn,
-									dist:   l2DistanceSquared(nbrVecB, nnVec),
-								}
-							}
-						}
-						nbrNode.neighbors = robustPrune(nbr, cands, alpha, maxDegree, vs)
-					}
+				if found {
+					continue
 				}
+				updated := append(cur, nid)
+				if len(updated) > 2*maxDegree {
+					// nbrVecB (slotBest) tenu pendant la boucle ; nnVec (slotProbe) transitoire.
+					nbrVecB := vs.vec(nbr, slotBest)
+					cands := make([]searchCandidate, len(updated))
+					for ci, nn := range updated {
+						nnVec := vs.vec(nn, slotProbe)
+						if nnVec != nil {
+							cands[ci] = searchCandidate{nodeID: nn, dist: l2DistanceSquared(nbrVecB, nnVec)}
+						}
+					}
+					updated = robustPrune(nbr, cands, alpha, maxDegree, vs)
+				}
+				store.set(nbr, updated)
 			}
 		}
 	}
 
-	for i := range nodes {
-		if len(nodes[i].neighbors) > maxDegree {
-			node := &nodes[i]
-			nodeVecB := vs.vec(node.id, slotBest)
-			cands := make([]searchCandidate, len(node.neighbors))
-			for ci, nn := range node.neighbors {
-				nnVec := vs.vec(nn, slotProbe)
-				if nnVec != nil {
-					cands[ci] = searchCandidate{
-						nodeID: nn,
-						dist:   l2DistanceSquared(nodeVecB, nnVec),
-					}
-				}
-			}
-			node.neighbors = robustPrune(node.id, cands, alpha, maxDegree, vs)
+	for i := 0; i < n; i++ {
+		if store.degree(int64(i)) <= maxDegree {
+			continue
 		}
+		cur := store.loadInto(int64(i), finalBuf[:0])
+		nodeVecB := vs.vec(int64(i), slotBest)
+		cands := make([]searchCandidate, len(cur))
+		for ci, nn := range cur {
+			nnVec := vs.vec(nn, slotProbe)
+			if nnVec != nil {
+				cands[ci] = searchCandidate{nodeID: nn, dist: l2DistanceSquared(nodeVecB, nnVec)}
+			}
+		}
+		store.set(int64(i), robustPrune(int64(i), cands, alpha, maxDegree, vs))
 	}
-	return nil
+	return store, nil
 }
 
-// buildGraphParallel parallelizes each Vamana pass with a worker pool.
-// Neighbor slices are replaced atomically (never mutated in-place) for race-free reads during greedySearch.
-func buildGraphParallel(
+// buildGraphParallelStore : build Vamana parallèle sur l'arène plate. Le swap lock-free d'un
+// pointeur de slice immuable du build antérieur est remplacé par un mécanisme équivalent SÛR
+// sous -race : toute lecture ET écriture d'un voisinage passe par le mutex shardé du nœud
+// (store.lock/unlock). Une lecture rend une COPIE (loadInto dans un tampon détenu par le
+// worker), donc valide après unlock. Un seul verrou de nœud est jamais tenu à la fois (aucune
+// imbrication) : pas d'interblocage.
+func buildGraphParallelStore(
 	ctx context.Context,
-	nodes []graphNode,
+	n int,
 	vs vecSource,
 	medoid int64,
 	maxDegree int,
@@ -597,45 +692,32 @@ func buildGraphParallel(
 	alpha float64,
 	passes int,
 	workers int,
-) error {
-	n := len(nodes)
+) (*flatNeighborStore, error) {
+	store := newFlatNeighborStore(n, maxDegree, true)
 
 	rng := rand.New(rand.NewPCG(42, 0))
-	initRandomNeighbors(rng, nodes, maxDegree)
+	initRandomNeighborsStore(rng, store, n, maxDegree)
 	orders := shuffleOrders(rng, n, passes)
 
-	neighborStore := make([]atomic.Pointer[[]int64], n)
-	for i := range n {
-		stored := append([]int64(nil), nodes[i].neighbors...)
-		neighborStore[i].Store(&stored)
-	}
-
-	getNeighbors := func(id int64) []int64 {
-		if id < 0 || int(id) >= n {
-			return nil
+	// processNode reçoit le vecSource propre au worker (wvs) et deux tampons de voisinage
+	// (nbrBuf pour les lectures greedySearch/candidats, rmwBuf pour la boucle arêtes retour) :
+	// jamais partagés entre goroutines.
+	processNode := func(oi int, wvs vecSource, nbrBuf, rmwBuf []int64) {
+		nid := int64(oi)
+		getNeighbors := func(id int64) []int64 {
+			if id < 0 || int(id) >= n {
+				return nil
+			}
+			store.lock(id)
+			r := store.loadInto(id, nbrBuf[:0])
+			store.unlock(id)
+			return r
 		}
-		p := neighborStore[id].Load()
-		if p == nil {
-			return nil
-		}
-		return *p
-	}
-	setNeighbors := func(id int64, nb []int64) {
-		stored := append([]int64(nil), nb...)
-		neighborStore[id].Store(&stored)
-	}
-
-	var locks graphShardMutexes
-
-	// processNode reçoit le vecSource propre au worker (wvs) : ses tampons de décodage
-	// arène ne sont jamais partagés entre goroutines.
-	processNode := func(oi int, wvs vecSource) {
-		node := &nodes[oi]
-		selfVec := wvs.vec(node.id, slotSelf)
+		selfVec := wvs.vec(nid, slotSelf)
 
 		candidates, _ := greedySearch(selfVec, medoid, beamWidth, wvs, getNeighbors)
 
-		for _, nbr := range getNeighbors(node.id) {
+		for _, nbr := range getNeighbors(nid) {
 			nbrVec := wvs.vec(nbr, slotProbe)
 			if nbrVec != nil {
 				d := l2DistanceSquared(selfVec, nbrVec)
@@ -643,49 +725,45 @@ func buildGraphParallel(
 			}
 		}
 
-		newNeighbors := robustPrune(node.id, candidates, alpha, maxDegree, wvs)
-		locks.lock(node.id)
-		setNeighbors(node.id, newNeighbors)
-		locks.unlock(node.id)
+		newNeighbors := robustPrune(nid, candidates, alpha, maxDegree, wvs)
+		store.lock(nid)
+		store.set(nid, newNeighbors)
+		store.unlock(nid)
 
 		for _, nbr := range newNeighbors {
 			if nbr < 0 || int(nbr) >= n {
 				continue
 			}
-			locks.lock(nbr)
-			cur := getNeighbors(nbr)
+			store.lock(nbr)
+			cur := store.loadInto(nbr, rmwBuf[:0])
 			found := false
 			for _, nn := range cur {
-				if nn == node.id {
+				if nn == nid {
 					found = true
 					break
 				}
 			}
 			if !found {
-				updated := append(append([]int64(nil), cur...), node.id)
+				updated := append(cur, nid)
 				if len(updated) > 2*maxDegree {
-					// nbrVecB (slotBest) tenu pendant toute la boucle ; nnVec (slotProbe)
-					// transitoire ; selfVec (slotSelf) n'est plus utilisé ici.
+					// nbrVecB (slotBest) tenu pendant la boucle ; nnVec (slotProbe) transitoire.
 					nbrVecB := wvs.vec(nbr, slotBest)
 					cands := make([]searchCandidate, len(updated))
 					for ci, nn := range updated {
 						nnVec := wvs.vec(nn, slotProbe)
 						if nnVec != nil {
-							cands[ci] = searchCandidate{
-								nodeID: nn,
-								dist:   l2DistanceSquared(nbrVecB, nnVec),
-							}
+							cands[ci] = searchCandidate{nodeID: nn, dist: l2DistanceSquared(nbrVecB, nnVec)}
 						}
 					}
 					updated = robustPrune(nbr, cands, alpha, maxDegree, wvs)
 				}
-				setNeighbors(nbr, updated)
+				store.set(nbr, updated)
 			}
-			locks.unlock(nbr)
+			store.unlock(nbr)
 		}
 	}
 
-	runPass := func(order []int) error {
+	runBatches := func(iter func(i int, wvs vecSource, nbrBuf, rmwBuf []int64)) error {
 		var wg sync.WaitGroup
 		var firstErr atomic.Pointer[error]
 		batchSize := (n + workers - 1) / workers
@@ -705,6 +783,8 @@ func buildGraphParallel(
 			go func(start, end int) {
 				defer wg.Done()
 				wvs := vs.clone()
+				nbrBuf := make([]int64, 0, store.stride)
+				rmwBuf := make([]int64, 0, store.stride)
 				for bi := start; bi < end; bi++ {
 					if firstErr.Load() != nil {
 						return
@@ -713,7 +793,7 @@ func buildGraphParallel(
 						firstErr.CompareAndSwap(nil, &err)
 						return
 					}
-					processNode(order[bi], wvs)
+					iter(bi, wvs, nbrBuf, rmwBuf)
 				}
 			}(batchStart, batchEnd)
 		}
@@ -725,73 +805,46 @@ func buildGraphParallel(
 	}
 
 	for pass := range passes {
-		_ = pass
 		if err := ctx.Err(); err != nil {
-			return err
+			return nil, err
 		}
-		if err := runPass(orders[pass]); err != nil {
-			return err
+		order := orders[pass]
+		if err := runBatches(func(bi int, wvs vecSource, nbrBuf, rmwBuf []int64) {
+			processNode(order[bi], wvs, nbrBuf, rmwBuf)
+		}); err != nil {
+			return nil, err
 		}
 	}
 
-	// Final pass: prune over-capacity neighborhoods (parallel).
-	var wg sync.WaitGroup
-	var firstErr atomic.Pointer[error]
-	batchSize := (n + workers - 1) / workers
-	for batchStart := 0; batchStart < n; batchStart += batchSize {
-		if firstErr.Load() != nil {
-			break
+	// Passe finale : élague les voisinages en surcapacité (parallèle).
+	if err := runBatches(func(i int, wvs vecSource, nbrBuf, _ []int64) {
+		id := int64(i)
+		store.lock(id)
+		d := store.degree(id)
+		var cur []int64
+		if d > maxDegree {
+			cur = store.loadInto(id, nbrBuf[:0])
 		}
-		if err := ctx.Err(); err != nil {
-			firstErr.Store(&err)
-			break
+		store.unlock(id)
+		if d <= maxDegree {
+			return
 		}
-		batchEnd := batchStart + batchSize
-		if batchEnd > n {
-			batchEnd = n
-		}
-		wg.Add(1)
-		go func(start, end int) {
-			defer wg.Done()
-			wvs := vs.clone()
-			for i := start; i < end; i++ {
-				if firstErr.Load() != nil {
-					return
-				}
-				if err := ctx.Err(); err != nil {
-					firstErr.CompareAndSwap(nil, &err)
-					return
-				}
-				if len(getNeighbors(int64(i))) <= maxDegree {
-					continue
-				}
-				cur := getNeighbors(int64(i))
-				// nodeVecB (slotBest) tenu pendant la boucle ; nnVec (slotProbe) transitoire.
-				nodeVecB := wvs.vec(int64(i), slotBest)
-				cands := make([]searchCandidate, len(cur))
-				for ci, nn := range cur {
-					nnVec := wvs.vec(nn, slotProbe)
-					if nnVec != nil {
-						cands[ci] = searchCandidate{
-							nodeID: nn,
-							dist:   l2DistanceSquared(nodeVecB, nnVec),
-						}
-					}
-				}
-				setNeighbors(int64(i), robustPrune(int64(i), cands, alpha, maxDegree, wvs))
+		// nodeVecB (slotBest) tenu pendant la boucle ; nnVec (slotProbe) transitoire.
+		nodeVecB := wvs.vec(id, slotBest)
+		cands := make([]searchCandidate, len(cur))
+		for ci, nn := range cur {
+			nnVec := wvs.vec(nn, slotProbe)
+			if nnVec != nil {
+				cands[ci] = searchCandidate{nodeID: nn, dist: l2DistanceSquared(nodeVecB, nnVec)}
 			}
-		}(batchStart, batchEnd)
-	}
-	wg.Wait()
-	if err := firstErr.Load(); err != nil {
-		return *err
+		}
+		pruned := robustPrune(id, cands, alpha, maxDegree, wvs)
+		store.lock(id)
+		store.set(id, pruned)
+		store.unlock(id)
+	}); err != nil {
+		return nil, err
 	}
 
-	for i := range n {
-		p := neighborStore[i].Load()
-		if p != nil {
-			nodes[i].neighbors = *p
-		}
-	}
-	return ctx.Err()
+	return store, ctx.Err()
 }
