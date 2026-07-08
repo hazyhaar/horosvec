@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"math"
 	"runtime"
-	"runtime/debug"
 	"sync"
 	"sync/atomic"
 
@@ -510,11 +509,11 @@ func (idx *Index) Build(ctx context.Context, iter VectorIterator) error {
 //
 // Pass 1 drains the iterator as a stream, writing each vector fp16 into a flat arena on
 // disk (fil de l'eau) — never materializing allVecs [][]float32 in fp32. Only the ext_ids
-// are kept in RAM. Pass 2 opens the arena, decodes it into ONE contiguous fp32 build buffer
-// (freed before returning), builds the Vamana graph on those fp16-rounded vectors, and
-// persists a vector-less SQLite (graph + codes + norms + meta, empty vector blob). The arena
-// then serves both the graph build and the Search rerank — graph and rerank see the SAME
-// fp16 vectors (consistency). Caller must hold idx.mu.Lock (Build does).
+// are kept in RAM. Pass 2 (buildFromOpenArena) opens the arena via mmap and builds the
+// Vamana graph reading vectors on demand — NO full fp32 build buffer O(N×dim×4) — then
+// persists a vector-less SQLite. The arena serves both the graph build and the Search
+// rerank — graph and rerank see the SAME fp16 vectors (consistency). Caller must hold
+// idx.mu.Lock (Build does).
 func (idx *Index) buildStreamingArena(ctx context.Context, iter VectorIterator) error {
 	// --- Pass 1: stream iterator → fp16 arena on disk, keep only ext_ids in RAM. ---
 	var (
@@ -561,131 +560,14 @@ func (idx *Index) buildStreamingArena(ctx context.Context, iter VectorIterator) 
 	if err := writer.finalize(); err != nil {
 		return err
 	}
+	_ = dim // dim est réaffirmé depuis l'en-tête de l'arène par buildFromOpenArena.
 
-	// --- Pass 2: decode arena into a transient contiguous fp32 build buffer. ---
-	// Cap le GOGC pendant le build : le graphe alloue beaucoup de scratch éphémère
-	// (greedySearch/robustPrune) ; sans bride, l'amplification GC (GOGC=100 double le tas
-	// vivant) fait exploser le pic RSS. Restauré en fin de build (defer).
-	prevGC := debug.SetGCPercent(streamingBuildGCPercent)
-	defer debug.SetGCPercent(prevGC)
-
-	// Décoder l'arène fp16 en un tampon fp32 contigu, puis LIBÉRER immédiatement les octets
-	// fp16 (ar.data) AVANT buildGraph : ne pas maintenir simultanément fp16 (256 Mo/1M) et
-	// fp32 (512 Mo/1M). L'arène de rerank est rouverte après la persistance.
+	// --- Pass 2: build graph reading vectors on demand from the mmap arena (no fp32 buffer).
 	ar, err := openArena(idx.cfg.ArenaPath)
 	if err != nil {
 		return err
 	}
-	n := int(ar.count)
-	if n != len(allIDs) {
-		return fmt.Errorf("horosvec: arena count %d != ext_id count %d", n, len(allIDs))
-	}
-	buildFlat := make([]float32, n*dim)
-	rowsView := make([][]float32, n)
-	for i := 0; i < n; i++ {
-		row := buildFlat[i*dim : (i+1)*dim]
-		if !ar.vecInto(int64(i), row) {
-			return fmt.Errorf("horosvec: arena decode node %d out of range", i)
-		}
-		rowsView[i] = row
-	}
-	ar = nil // libérer les octets fp16 : buildGraph ne travaille que sur buildFlat (fp32)
-	runtime.GC()
-
-	idx.dim = dim
-	rounds := idx.cfg.RotationRounds
-	seed := effectiveRotationSeed(idx.cfg)
-	idx.rotator = NewRotator(dim, rounds, seed)
-	idx.codeDim = idx.rotator.CodeDim()
-
-	rotated := make([]float32, idx.codeDim)
-	centroid := make([]float32, idx.codeDim)
-	for _, v := range rowsView {
-		idx.rotator.Rotate(v, rotated)
-		for j, val := range rotated {
-			centroid[j] += val
-		}
-	}
-	invN := float32(1.0 / float64(n))
-	for j := range idx.codeDim {
-		centroid[j] *= invN
-	}
-
-	idx.encoder = NewEncoder(centroid)
-	idx.centroid = NewCentroidTracker(dim, idx.cfg.DriftThreshold, idx.cfg.InsertRatioThreshold)
-	idx.centroid.AddBatch(rowsView)
-	idx.centroid.SnapshotBuild()
-
-	buildWorkers := effectiveBuildWorkers(idx.cfg)
-	nodes, err := encodeGraphNodes(ctx, idx.rotator, idx.encoder, rowsView, allIDs, buildWorkers)
-	if err != nil {
-		return err
-	}
-
-	idx.medoid = findMedoid(nodes)
-	if err := buildGraph(ctx, nodes, idx.medoid, idx.cfg.MaxDegree, idx.cfg.SearchListSize, idx.cfg.Alpha, idx.cfg.BuildPasses, buildWorkers); err != nil {
-		return err
-	}
-
-	// Persist: vector-less SQLite (arena is the source of raw vectors).
-	tx, err := idx.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("horosvec: begin tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	if _, err := tx.Exec("DELETE FROM vindex_nodes"); err != nil {
-		return fmt.Errorf("horosvec: clear nodes: %w", err)
-	}
-	if _, err := tx.Exec("DELETE FROM vindex_meta"); err != nil {
-		return fmt.Errorf("horosvec: clear meta: %w", err)
-	}
-	rotMeta := rotationMeta{
-		seed:     seed,
-		rounds:   rounds,
-		codeDim:  idx.codeDim,
-		dbFormat: currentDBFormatVersion,
-	}
-	if err := saveGraphNoVec(tx, nodes, idx.medoid, dim, idx.cfg.MaxDegree, centroid, rotMeta); err != nil {
-		return fmt.Errorf("horosvec: save graph: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("horosvec: commit: %w", err)
-	}
-
-	idx.nextID = int64(n)
-	idx.built = true
-	idx.insertedSinceMedoid = 0
-
-	// Gros index vector-less : pas de flatVecs brute-force (le chemin brute-force n'est
-	// atteint que sous BruteForceThreshold, jamais en mode arène).
-	idx.flatVecs = nil
-	idx.flatIDs = nil
-	idx.cache.clear()
-
-	// Libérer explicitement le tampon fp32 transitoire AVANT de rouvrir l'arène de rerank :
-	// on ne maintient jamais simultanément le fp32 de build (512 Mo/1M) et le fp16 de rerank
-	// (256 Mo/1M).
-	nodes = nil
-	buildFlat = nil
-	rowsView = nil
-	runtime.GC()
-
-	// Rouvrir l'arène fp16 en lecture seule : seule source résidente des vecteurs bruts au
-	// rerank. (dim, count) sont garantis cohérents par construction.
-	rerankArena, err := openArena(idx.cfg.ArenaPath)
-	if err != nil {
-		return err
-	}
-
-	if err := idx.rebuildPlaneLocked(); err != nil {
-		return fmt.Errorf("horosvec: build hot plane: %w", err)
-	}
-	idx.arena = rerankArena
-
-	// Payer la collecte des déchets de construction au moment froid et déterministe.
-	runtime.GC()
-	return nil
+	return idx.buildFromOpenArena(ctx, ar, allIDs)
 }
 
 // Search finds the topK nearest neighbors.
@@ -1259,7 +1141,7 @@ func (idx *Index) Insert(ctx context.Context, vecs [][]float32, ids [][]byte) er
 				nodeID: nodeID,
 				dist:   l2DistanceSquared(nbrNode.vec, vec),
 			})
-			pruned := robustPrune(nbr, cands, idx.cfg.Alpha, idx.cfg.MaxDegree, getVec)
+			pruned := robustPrune(nbr, cands, idx.cfg.Alpha, idx.cfg.MaxDegree, funcVecSource(getVec))
 			_ = setNeighbors(nbr, pruned)
 		}
 
@@ -1505,8 +1387,12 @@ func (idx *Index) rebuildInternal(ctx context.Context, iter VectorIterator) {
 	// Le rebuild a réécrit un graphe à blobs vecteur PLEINS et un flatVecs frais : l'arène
 	// fp16 éventuelle est désormais PÉRIMÉE (anciens vecteurs, count potentiellement faux).
 	// La lâcher évite un rerank sur vecteurs obsolètes ; le rerank repasse par les blobs SQL
-	// (présents) et l'index redevient graphe-backed (Insert de nouveau autorisé).
-	idx.arena = nil
+	// (présents) et l'index redevient graphe-backed (Insert de nouveau autorisé). L'arène
+	// mmap est libérée (munmap) avant d'être oubliée.
+	if idx.arena != nil {
+		_ = idx.arena.close()
+		idx.arena = nil
+	}
 
 	if err := idx.rebuildPlaneLocked(); err != nil {
 		slog.Error("horosvec: rebuild hot plane failed", "err", err)
@@ -1537,6 +1423,12 @@ func (idx *Index) Count() int {
 func (idx *Index) Close() error {
 	idx.rebuildMu.Lock()
 	defer idx.rebuildMu.Unlock()
+	idx.mu.Lock()
+	if idx.arena != nil {
+		_ = idx.arena.close()
+		idx.arena = nil
+	}
+	idx.mu.Unlock()
 	idx.cache.clear()
 	return nil
 }

@@ -21,6 +21,55 @@ type graphNode struct {
 	l1Norm    float64
 }
 
+// Slots de tampon d'un vecSource. Ils nomment les vecteurs qui peuvent être
+// SIMULTANÉMENT vivants dans une même passe de construction (par worker), afin qu'une
+// implémentation à décodage à la demande (arène) n'écrase jamais un vecteur encore
+// référencé : slotSelf = le nœud traité (tenu pendant tout processNode), slotBest = le
+// meilleur candidat de robustPrune (tenu pendant la boucle interne), slotProbe = le
+// vecteur transitoire comparé immédiatement puis oublié.
+const (
+	slotSelf  = 0
+	slotBest  = 1
+	slotProbe = 2
+)
+
+// vecSource fournit les vecteurs fp32 des nœuds à la construction du graphe. Deux
+// implémentations : memVecSource (slices stables en mémoire, zéro copie, comportement
+// legacy strictement inchangé) et arenaVecSource (décodage fp16→fp32 à la demande depuis
+// l'arène mmap, dans des tampons par worker réutilisés). Le paramètre slot n'a d'effet que
+// sur l'implémentation arène (choix du tampon) ; memVecSource l'ignore et renvoie toujours
+// la slice stable du nœud.
+type vecSource interface {
+	// vec renvoie le vecteur du nœud id dans le tampon slot, ou nil si id est hors bornes.
+	// Le contenu est valide jusqu'au prochain vec(_, slot) sur le MÊME slot de la MÊME
+	// instance ; deux slots distincts ne s'écrasent jamais entre eux.
+	vec(id int64, slot int) []float32
+	// clone renvoie une instance indépendante (tampons propres) pour un worker donné.
+	clone() vecSource
+}
+
+// memVecSource renvoie les slices vecteur stables détenues par les graphNode. Sans état
+// mutable : clone se renvoie lui-même et l'accès concurrent est sûr (lecture seule).
+type memVecSource struct{ nodes []graphNode }
+
+func (m *memVecSource) vec(id int64, _ int) []float32 {
+	if id >= 0 && int(id) < len(m.nodes) {
+		return m.nodes[id].vec
+	}
+	return nil
+}
+
+func (m *memVecSource) clone() vecSource { return m }
+
+// funcVecSource adapte une fonction d'accès vecteur (chemin Insert : cache LRU + overlay SQL)
+// en vecSource. Les slices renvoyées sont détenues par le cache (stables) : le slot est ignoré
+// et clone se renvoie lui-même (lecture seule, sûr en concurrence sur ce chemin).
+type funcVecSource func(int64) []float32
+
+func (f funcVecSource) vec(id int64, _ int) []float32 { return f(id) }
+
+func (f funcVecSource) clone() vecSource { return f }
+
 // l2DistanceSquared computes squared L2 distance between two float32 vectors.
 // Unrolled 8x for performance.
 func l2DistanceSquared(a, b []float32) float64 {
@@ -97,6 +146,37 @@ func findMedoid(nodes []graphNode) int64 {
 	return bestID
 }
 
+// findMedoidSource trouve le nœud le plus proche du centroïde en lisant les vecteurs à la
+// demande depuis vs (chemin arène : node.vec est nil). Séquentiel : un seul tampon slotProbe
+// suffit, aucun vecteur n'est tenu au-delà de son usage immédiat.
+func findMedoidSource(n int, dim int, vs vecSource) int64 {
+	if n == 0 {
+		return 0
+	}
+	centroid := make([]float64, dim)
+	for i := 0; i < n; i++ {
+		v := vs.vec(int64(i), slotProbe)
+		for j := 0; j < dim; j++ {
+			centroid[j] += float64(v[j])
+		}
+	}
+	invN := 1.0 / float64(n)
+	centroidF32 := make([]float32, dim)
+	for j := range dim {
+		centroidF32[j] = float32(centroid[j] * invN)
+	}
+	var bestID int64
+	bestDist := math.MaxFloat64
+	for i := 0; i < n; i++ {
+		d := l2DistanceSquared(centroidF32, vs.vec(int64(i), slotProbe))
+		if d < bestDist {
+			bestDist = d
+			bestID = int64(i)
+		}
+	}
+	return bestID
+}
+
 // greedySearch performs a beam search on the Vamana graph starting from the medoid.
 // It returns the top-L closest candidates and the set of all visited nodes.
 // getVec returns the vector for a given nodeID.
@@ -105,13 +185,15 @@ func greedySearch(
 	query []float32,
 	start int64,
 	beamWidth int,
-	getVec func(int64) []float32,
+	vs vecSource,
 	getNeighbors func(int64) []int64,
 ) (candidates []searchCandidate, visited map[int64]bool) {
 	visited = make(map[int64]bool)
 
-	// Initialize with start node
-	startVec := getVec(start)
+	// query est fourni par l'appelant (tampon slotSelf). greedySearch ne tient jamais deux
+	// vecteurs récupérés simultanément : un seul tampon transitoire (slotProbe) suffit, il
+	// n'écrase jamais query.
+	startVec := vs.vec(start, slotProbe)
 	if startVec == nil {
 		return nil, visited
 	}
@@ -143,7 +225,7 @@ func greedySearch(
 			}
 			visited[nbr] = true
 
-			nbrVec := getVec(nbr)
+			nbrVec := vs.vec(nbr, slotProbe)
 			if nbrVec == nil {
 				continue
 			}
@@ -193,7 +275,7 @@ func robustPrune(
 	candidates []searchCandidate,
 	alpha float64,
 	maxDegree int,
-	getVec func(int64) []float32,
+	vs vecSource,
 ) []int64 {
 	// Remove self and duplicates
 	seen := map[int64]bool{nodeID: true}
@@ -210,7 +292,12 @@ func robustPrune(
 	sortCandidates(filtered)
 
 	result := make([]int64, 0, maxDegree)
-	nodeVec := getVec(nodeID)
+	// Trois vecteurs peuvent être simultanément vivants : nodeVec (tenu toute la fonction),
+	// bestVec (tenu pendant la boucle interne), cVec (transitoire). Trois slots distincts
+	// (slotSelf/slotBest/slotProbe) garantissent qu'aucun n'écrase l'autre côté arène.
+	// robustPrune exclut nodeID de filtered (seen), donc best != nodeID et cVec != nodeVec :
+	// aucun alias entre slots ne fausse la distance.
+	nodeVec := vs.vec(nodeID, slotSelf)
 	if nodeVec == nil {
 		return result
 	}
@@ -221,7 +308,7 @@ func robustPrune(
 		filtered = filtered[1:]
 		result = append(result, best.nodeID)
 
-		bestVec := getVec(best.nodeID)
+		bestVec := vs.vec(best.nodeID, slotBest)
 		if bestVec == nil {
 			continue
 		}
@@ -230,7 +317,7 @@ func robustPrune(
 		// (scaled by alpha) — the α-RNG rule
 		kept := filtered[:0]
 		for _, c := range filtered {
-			cVec := getVec(c.nodeID)
+			cVec := vs.vec(c.nodeID, slotProbe)
 			if cVec == nil {
 				continue
 			}
@@ -350,20 +437,43 @@ func buildGraph(
 	if len(nodes) == 0 {
 		return nil
 	}
+	// Chemin en mémoire : les vecteurs sont les slices stables des graphNode (zéro copie),
+	// comportement legacy strictement inchangé. Le chemin arène passe par buildGraphSource.
+	return buildGraphSource(ctx, nodes, &memVecSource{nodes: nodes}, medoid, maxDegree, beamWidth, alpha, passes, buildWorkers)
+}
+
+// buildGraphSource construit le graphe Vamana en lisant les vecteurs via vs (mémoire ou
+// arène). Les voisinages sont portés par nodes[i].neighbors ; vs ne fournit que les
+// vecteurs. buildWorkers==1 emprunte le chemin séquentiel déterministe.
+func buildGraphSource(
+	ctx context.Context,
+	nodes []graphNode,
+	vs vecSource,
+	medoid int64,
+	maxDegree int,
+	beamWidth int,
+	alpha float64,
+	passes int,
+	buildWorkers int,
+) error {
+	if len(nodes) == 0 {
+		return nil
+	}
 	workers := buildWorkers
 	if workers == 0 {
 		workers = runtime.GOMAXPROCS(0)
 	}
 	if workers == 1 {
-		return buildGraphSequential(ctx, nodes, medoid, maxDegree, beamWidth, alpha, passes)
+		return buildGraphSequential(ctx, nodes, vs, medoid, maxDegree, beamWidth, alpha, passes)
 	}
-	return buildGraphParallel(ctx, nodes, medoid, maxDegree, beamWidth, alpha, passes, workers)
+	return buildGraphParallel(ctx, nodes, vs, medoid, maxDegree, beamWidth, alpha, passes, workers)
 }
 
 // buildGraphSequential is the legacy single-threaded Vamana build (BuildWorkers=1).
 func buildGraphSequential(
 	ctx context.Context,
 	nodes []graphNode,
+	vs vecSource,
 	medoid int64,
 	maxDegree int,
 	beamWidth int,
@@ -372,12 +482,6 @@ func buildGraphSequential(
 ) error {
 	n := len(nodes)
 
-	getVec := func(id int64) []float32 {
-		if id >= 0 && int(id) < n {
-			return nodes[id].vec
-		}
-		return nil
-	}
 	getNeighbors := func(id int64) []int64 {
 		if id >= 0 && int(id) < n {
 			return nodes[id].neighbors
@@ -410,18 +514,19 @@ func buildGraphSequential(
 			}
 
 			node := &nodes[oi]
+			selfVec := vs.vec(node.id, slotSelf)
 
-			candidates, _ := greedySearch(node.vec, medoid, beamWidth, getVec, getNeighbors)
+			candidates, _ := greedySearch(selfVec, medoid, beamWidth, vs, getNeighbors)
 
 			for _, nbr := range node.neighbors {
-				nbrVec := getVec(nbr)
+				nbrVec := vs.vec(nbr, slotProbe)
 				if nbrVec != nil {
-					d := l2DistanceSquared(node.vec, nbrVec)
+					d := l2DistanceSquared(selfVec, nbrVec)
 					candidates = append(candidates, searchCandidate{nodeID: nbr, dist: d})
 				}
 			}
 
-			newNeighbors := robustPrune(node.id, candidates, alpha, maxDegree, getVec)
+			newNeighbors := robustPrune(node.id, candidates, alpha, maxDegree, vs)
 			node.neighbors = newNeighbors
 
 			for _, nbr := range newNeighbors {
@@ -439,17 +544,21 @@ func buildGraphSequential(
 				if !found {
 					nbrNode.neighbors = append(nbrNode.neighbors, node.id)
 					if len(nbrNode.neighbors) > 2*maxDegree {
+						// nbrVecB (slotBest) tenu pendant toute la boucle ; nnVec (slotProbe)
+						// transitoire. robustPrune(nbr) réécrit ensuite ces slots, mais cands
+						// est déjà matérialisé (distances calculées).
+						nbrVecB := vs.vec(nbr, slotBest)
 						cands := make([]searchCandidate, len(nbrNode.neighbors))
 						for ci, nn := range nbrNode.neighbors {
-							nnVec := getVec(nn)
+							nnVec := vs.vec(nn, slotProbe)
 							if nnVec != nil {
 								cands[ci] = searchCandidate{
 									nodeID: nn,
-									dist:   l2DistanceSquared(nbrNode.vec, nnVec),
+									dist:   l2DistanceSquared(nbrVecB, nnVec),
 								}
 							}
 						}
-						nbrNode.neighbors = robustPrune(nbr, cands, alpha, maxDegree, getVec)
+						nbrNode.neighbors = robustPrune(nbr, cands, alpha, maxDegree, vs)
 					}
 				}
 			}
@@ -459,17 +568,18 @@ func buildGraphSequential(
 	for i := range nodes {
 		if len(nodes[i].neighbors) > maxDegree {
 			node := &nodes[i]
+			nodeVecB := vs.vec(node.id, slotBest)
 			cands := make([]searchCandidate, len(node.neighbors))
 			for ci, nn := range node.neighbors {
-				nnVec := getVec(nn)
+				nnVec := vs.vec(nn, slotProbe)
 				if nnVec != nil {
 					cands[ci] = searchCandidate{
 						nodeID: nn,
-						dist:   l2DistanceSquared(node.vec, nnVec),
+						dist:   l2DistanceSquared(nodeVecB, nnVec),
 					}
 				}
 			}
-			node.neighbors = robustPrune(node.id, cands, alpha, maxDegree, getVec)
+			node.neighbors = robustPrune(node.id, cands, alpha, maxDegree, vs)
 		}
 	}
 	return nil
@@ -480,6 +590,7 @@ func buildGraphSequential(
 func buildGraphParallel(
 	ctx context.Context,
 	nodes []graphNode,
+	vs vecSource,
 	medoid int64,
 	maxDegree int,
 	beamWidth int,
@@ -499,12 +610,6 @@ func buildGraphParallel(
 		neighborStore[i].Store(&stored)
 	}
 
-	getVec := func(id int64) []float32 {
-		if id >= 0 && int(id) < n {
-			return nodes[id].vec
-		}
-		return nil
-	}
 	getNeighbors := func(id int64) []int64 {
 		if id < 0 || int(id) >= n {
 			return nil
@@ -522,20 +627,23 @@ func buildGraphParallel(
 
 	var locks graphShardMutexes
 
-	processNode := func(oi int) {
+	// processNode reçoit le vecSource propre au worker (wvs) : ses tampons de décodage
+	// arène ne sont jamais partagés entre goroutines.
+	processNode := func(oi int, wvs vecSource) {
 		node := &nodes[oi]
+		selfVec := wvs.vec(node.id, slotSelf)
 
-		candidates, _ := greedySearch(node.vec, medoid, beamWidth, getVec, getNeighbors)
+		candidates, _ := greedySearch(selfVec, medoid, beamWidth, wvs, getNeighbors)
 
 		for _, nbr := range getNeighbors(node.id) {
-			nbrVec := getVec(nbr)
+			nbrVec := wvs.vec(nbr, slotProbe)
 			if nbrVec != nil {
-				d := l2DistanceSquared(node.vec, nbrVec)
+				d := l2DistanceSquared(selfVec, nbrVec)
 				candidates = append(candidates, searchCandidate{nodeID: nbr, dist: d})
 			}
 		}
 
-		newNeighbors := robustPrune(node.id, candidates, alpha, maxDegree, getVec)
+		newNeighbors := robustPrune(node.id, candidates, alpha, maxDegree, wvs)
 		locks.lock(node.id)
 		setNeighbors(node.id, newNeighbors)
 		locks.unlock(node.id)
@@ -556,17 +664,20 @@ func buildGraphParallel(
 			if !found {
 				updated := append(append([]int64(nil), cur...), node.id)
 				if len(updated) > 2*maxDegree {
+					// nbrVecB (slotBest) tenu pendant toute la boucle ; nnVec (slotProbe)
+					// transitoire ; selfVec (slotSelf) n'est plus utilisé ici.
+					nbrVecB := wvs.vec(nbr, slotBest)
 					cands := make([]searchCandidate, len(updated))
 					for ci, nn := range updated {
-						nnVec := getVec(nn)
+						nnVec := wvs.vec(nn, slotProbe)
 						if nnVec != nil {
 							cands[ci] = searchCandidate{
 								nodeID: nn,
-								dist:   l2DistanceSquared(nodes[nbr].vec, nnVec),
+								dist:   l2DistanceSquared(nbrVecB, nnVec),
 							}
 						}
 					}
-					updated = robustPrune(nbr, cands, alpha, maxDegree, getVec)
+					updated = robustPrune(nbr, cands, alpha, maxDegree, wvs)
 				}
 				setNeighbors(nbr, updated)
 			}
@@ -593,6 +704,7 @@ func buildGraphParallel(
 			wg.Add(1)
 			go func(start, end int) {
 				defer wg.Done()
+				wvs := vs.clone()
 				for bi := start; bi < end; bi++ {
 					if firstErr.Load() != nil {
 						return
@@ -601,7 +713,7 @@ func buildGraphParallel(
 						firstErr.CompareAndSwap(nil, &err)
 						return
 					}
-					processNode(order[bi])
+					processNode(order[bi], wvs)
 				}
 			}(batchStart, batchEnd)
 		}
@@ -641,6 +753,7 @@ func buildGraphParallel(
 		wg.Add(1)
 		go func(start, end int) {
 			defer wg.Done()
+			wvs := vs.clone()
 			for i := start; i < end; i++ {
 				if firstErr.Load() != nil {
 					return
@@ -653,17 +766,19 @@ func buildGraphParallel(
 					continue
 				}
 				cur := getNeighbors(int64(i))
+				// nodeVecB (slotBest) tenu pendant la boucle ; nnVec (slotProbe) transitoire.
+				nodeVecB := wvs.vec(int64(i), slotBest)
 				cands := make([]searchCandidate, len(cur))
 				for ci, nn := range cur {
-					nnVec := getVec(nn)
+					nnVec := wvs.vec(nn, slotProbe)
 					if nnVec != nil {
 						cands[ci] = searchCandidate{
 							nodeID: nn,
-							dist:   l2DistanceSquared(nodes[i].vec, nnVec),
+							dist:   l2DistanceSquared(nodeVecB, nnVec),
 						}
 					}
 				}
-				setNeighbors(int64(i), robustPrune(int64(i), cands, alpha, maxDegree, getVec))
+				setNeighbors(int64(i), robustPrune(int64(i), cands, alpha, maxDegree, wvs))
 			}
 		}(batchStart, batchEnd)
 	}
