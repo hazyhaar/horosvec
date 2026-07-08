@@ -68,6 +68,13 @@ func TestRebuildAsyncRefusedOnArena(t *testing.T) {
 	if idx.arena == nil {
 		t.Fatal("idx.arena annulé par le rebuild refusé")
 	}
+	// Sentinelle de régression : le refus étant synchrone, aucune goroutine de rebuild ne
+	// tourne — rebuildMu doit être libre. Si les gardes étaient retirés, rebuildInternal
+	// détiendrait rebuildMu (et idx.mu) le temps du rebuild et ce TryLock échouerait.
+	if !idx.rebuildMu.TryLock() {
+		t.Fatal("rebuildMu détenu — une goroutine de rebuild a démarré malgré le refus")
+	}
+	idx.rebuildMu.Unlock()
 	if !strings.Contains(buf.String(), "arena-backed index") {
 		t.Fatalf("refus non journalisé; log=%q", buf.String())
 	}
