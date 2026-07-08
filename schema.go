@@ -109,40 +109,29 @@ type rotationMeta struct {
 	dbFormat int
 }
 
-// saveGraph persists all nodes and metadata from a build.
+// saveGraph persists all nodes (avec leur blob vecteur) et les métadonnées d'un build en
+// mémoire (chemin legacy). Le chemin arène vector-less persiste en streaming via
+// saveGraphStreamArena (blob vecteur vide, encodage à la volée).
 func saveGraph(tx *sql.Tx, nodes []graphNode, medoid int64, dim int, maxDegree int, centroid []float32, rot rotationMeta) error {
-	return saveGraphImpl(tx, nodes, medoid, dim, maxDegree, centroid, rot, false)
-}
-
-// saveGraphNoVec persiste le graphe sans le blob vecteur (SQLite allégé du streaming
-// vector-less) : node_id/ext_id/neighbors/quantized/normes + méta, mais un blob vecteur
-// VIDE. La source des vecteurs bruts au rerank et à l'export devient l'arène fp16. Le plan
-// chaud (buildHotPlane) ne lit jamais `vector`, donc reste intact. Un index EXISTANT
-// portant des blobs reste lisible (loadNode fonctionne, blob non vide) — la lecture est
-// rétro-compatible.
-func saveGraphNoVec(tx *sql.Tx, nodes []graphNode, medoid int64, dim int, maxDegree int, centroid []float32, rot rotationMeta) error {
-	return saveGraphImpl(tx, nodes, medoid, dim, maxDegree, centroid, rot, true)
-}
-
-func saveGraphImpl(tx *sql.Tx, nodes []graphNode, medoid int64, dim int, maxDegree int, centroid []float32, rot rotationMeta, omitVec bool) error {
 	for _, n := range nodes {
-		vec := n.vec
-		if omitVec {
-			vec = nil // blob vecteur vide : la colonne BLOB NOT NULL accepte une longueur 0
-		}
-		if err := saveNode(tx, n.id, n.extID, n.neighbors, vec, n.code, n.sqNorm, n.l1Norm); err != nil {
+		if err := saveNode(tx, n.id, n.extID, n.neighbors, n.vec, n.code, n.sqNorm, n.l1Norm); err != nil {
 			return fmt.Errorf("save node %d: %w", n.id, err)
 		}
 	}
+	return saveGraphMeta(tx, medoid, dim, maxDegree, len(nodes), centroid, rot)
+}
 
+// saveGraphMeta persiste les métadonnées d'index dans vindex_meta. Partagé par le save
+// legacy (saveGraphImpl) et le save streaming arène (saveGraphStreamArena).
+func saveGraphMeta(tx *sql.Tx, medoid int64, dim, maxDegree, nodeCount int, centroid []float32, rot rotationMeta) error {
 	metas := map[string][]byte{
 		"medoid":            serializeInt64(medoid),
 		"dimension":         serializeInt64(int64(dim)),
 		"max_degree":        serializeInt64(int64(maxDegree)),
-		"node_count":        serializeInt64(int64(len(nodes))),
+		"node_count":        serializeInt64(int64(nodeCount)),
 		"centroid":          serializeFloat32s(centroid),
 		"built_at":          []byte(time.Now().UTC().Format(time.RFC3339)),
-		"vectors_at_build":  serializeInt64(int64(len(nodes))),
+		"vectors_at_build":  serializeInt64(int64(nodeCount)),
 		"db_format_version": serializeInt64(int64(rot.dbFormat)),
 		"rotation_seed":     serializeInt64(int64(rot.seed)),
 		"rotation_rounds":   serializeInt64(int64(rot.rounds)),
@@ -157,7 +146,6 @@ func saveGraphImpl(tx *sql.Tx, nodes []graphNode, medoid int64, dim int, maxDegr
 			return fmt.Errorf("save meta %s: %w", k, err)
 		}
 	}
-
 	return nil
 }
 

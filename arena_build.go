@@ -2,14 +2,13 @@ package horosvec
 
 import (
 	"context"
+	"database/sql"
 	"encoding/binary"
 	"fmt"
 	"os"
 	"runtime"
 	"runtime/debug"
 	"strconv"
-	"sync"
-	"sync/atomic"
 )
 
 // arenaVecSource décode les vecteurs fp16→fp32 à la demande depuis l'arène mmap, dans
@@ -176,15 +175,14 @@ func (idx *Index) buildFromOpenArena(ctx context.Context, ar *arena, extIDs [][]
 	idx.centroid.SnapshotBuild()
 
 	buildWorkers := effectiveBuildWorkers(idx.cfg)
-	nodes, err := encodeGraphNodesArena(ctx, idx.rotator, idx.encoder, ar, extIDs, buildWorkers)
-	if err != nil {
-		_ = ar.close()
-		return err
-	}
-
 	idx.medoid = findMedoidSource(n, dim, newArenaVecSource(ar))
-	if err := buildGraphSource(ctx, nodes, newArenaVecSource(ar), idx.medoid,
-		idx.cfg.MaxDegree, idx.cfg.SearchListSize, idx.cfg.Alpha, idx.cfg.BuildPasses, buildWorkers); err != nil {
+
+	// Construction de l'adjacence dans une arène plate (flatNeighborStore) : aucun graphNode,
+	// aucune tranche de voisins par nœud, aucun code RaBitQ résident pendant la construction.
+	// Les codes/normes sont encodés à la volée au moment de la persistance (streaming).
+	store, err := buildGraphStore(ctx, n, newArenaVecSource(ar), idx.medoid,
+		idx.cfg.MaxDegree, idx.cfg.SearchListSize, idx.cfg.Alpha, idx.cfg.BuildPasses, buildWorkers)
+	if err != nil {
 		_ = ar.close()
 		return err
 	}
@@ -216,7 +214,8 @@ func (idx *Index) buildFromOpenArena(ctx context.Context, ar *arena, extIDs [][]
 		codeDim:  idx.codeDim,
 		dbFormat: currentDBFormatVersion,
 	}
-	if err := saveGraphNoVec(tx, nodes, idx.medoid, dim, idx.cfg.MaxDegree, centroid, rotMeta); err != nil {
+	if err := saveGraphStreamArena(ctx, tx, store, idx.rotator, idx.encoder, ar, extIDs,
+		idx.medoid, dim, idx.cfg.MaxDegree, centroid, rotMeta); err != nil {
 		_ = ar.close()
 		return fmt.Errorf("horosvec: save graph: %w", err)
 	}
@@ -235,9 +234,9 @@ func (idx *Index) buildFromOpenArena(ctx context.Context, ar *arena, extIDs [][]
 	idx.flatIDs = nil
 	idx.cache.clear()
 
-	// Libère le graphe transitoire avant de bâtir le plan chaud, puis paie la collecte des
-	// déchets au moment froid et déterministe.
-	nodes = nil
+	// Libère l'arène plate d'adjacence transitoire avant de bâtir le plan chaud, puis paie la
+	// collecte des déchets au moment froid et déterministe.
+	store = nil
 	runtime.GC()
 
 	if err := idx.rebuildPlaneLocked(); err != nil {
@@ -252,104 +251,49 @@ func (idx *Index) buildFromOpenArena(ctx context.Context, ar *arena, extIDs [][]
 	return nil
 }
 
-// encodeGraphNodesArena encode les nœuds du graphe (codes RaBitQ + normes) en lisant les
-// vecteurs à la demande depuis l'arène (fp16→fp32), sans matérialiser de tampon fp32 plein.
-// node.vec reste nil : la source des vecteurs pour la construction et le rerank est l'arène.
-func encodeGraphNodesArena(
+// saveGraphStreamArena persiste l'index en streaming, sans jamais matérialiser de tableau de
+// nœuds. Pour chaque node_id 0..n-1 dans l'ordre : décodage du vecteur depuis l'arène
+// (fp16→fp32, tampons réutilisés), rotation, encodage RaBitQ (code + normes), puis insertion
+// SQLite allégée (blob vecteur vide) avec le voisinage lu depuis l'arène plate d'adjacence.
+// Les codes/normes ne sont donc résidents qu'un nœud à la fois : ils ne pèsent pas sur le pic
+// mémoire de la construction, qui ne porte plus que l'arène plate d'adjacence.
+//
+// L'encodage est séquentiel (le rotator réutilise fhtScratch, non sûr en concurrence, et la
+// transaction SQLite est mono-écrivain) : c'est une passe froide de persistance, une seule
+// fois, dont le coût est amorti par l'absence de pression GC.
+func saveGraphStreamArena(
 	ctx context.Context,
+	tx *sql.Tx,
+	store *flatNeighborStore,
 	rotator *Rotator,
 	encoder *Encoder,
 	ar *arena,
 	extIDs [][]byte,
-	workers int,
-) ([]graphNode, error) {
+	medoid int64,
+	dim, maxDegree int,
+	centroid []float32,
+	rot rotationMeta,
+) error {
 	n := int(ar.count)
-	dim := ar.dim
-	nodes := make([]graphNode, n)
-
-	if workers <= 1 {
-		rotated := make([]float32, rotator.CodeDim())
-		buf := make([]float32, dim)
-		for i := 0; i < n; i++ {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			if !ar.vecInto(int64(i), buf) {
-				return nil, fmt.Errorf("horosvec: arena decode node %d out of range", i)
-			}
-			rotator.Rotate(buf, rotated)
-			code, sqNorm, l1Norm := encoder.Encode(rotated)
-			nodes[i] = graphNode{
-				id:     int64(i),
-				extID:  extIDs[i],
-				vec:    nil,
-				code:   code,
-				sqNorm: sqNorm,
-				l1Norm: l1Norm,
-			}
+	if n != len(extIDs) {
+		return fmt.Errorf("horosvec: save stream: arena count %d != ext_id count %d", n, len(extIDs))
+	}
+	rotated := make([]float32, rotator.CodeDim())
+	buf := make([]float32, dim)
+	nbrBuf := make([]int64, 0, store.stride)
+	for i := 0; i < n; i++ {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("horosvec: %w", err)
 		}
-		return nodes, nil
-	}
-
-	// Rotator réutilise fhtScratch ; cloner un rotator par worker pour la sûreté concurrente.
-	workerRotators := make([]*Rotator, workers)
-	for i := range workers {
-		workerRotators[i] = NewRotatorWithCodeDim(
-			rotator.Dim(), rotator.CodeDim(), rotator.Rounds(), rotator.Seed(),
-		)
-	}
-
-	var wg sync.WaitGroup
-	var firstErr atomic.Pointer[error]
-	batchSize := (n + workers - 1) / workers
-	workerIdx := 0
-	for batchStart := 0; batchStart < n; batchStart += batchSize {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
+		if !ar.vecInto(int64(i), buf) {
+			return fmt.Errorf("horosvec: arena decode node %d out of range", i)
 		}
-		batchEnd := batchStart + batchSize
-		if batchEnd > n {
-			batchEnd = n
+		rotator.Rotate(buf, rotated)
+		code, sqNorm, l1Norm := encoder.Encode(rotated)
+		neighbors := store.loadInto(int64(i), nbrBuf[:0])
+		if err := saveNode(tx, int64(i), extIDs[i], neighbors, nil, code, sqNorm, l1Norm); err != nil {
+			return fmt.Errorf("horosvec: save node %d: %w", i, err)
 		}
-		wRot := workerRotators[workerIdx]
-		workerIdx++
-		wg.Add(1)
-		go func(start, end int, wr *Rotator) {
-			defer wg.Done()
-			rotated := make([]float32, wr.CodeDim())
-			buf := make([]float32, dim)
-			for i := start; i < end; i++ {
-				if firstErr.Load() != nil {
-					return
-				}
-				if err := ctx.Err(); err != nil {
-					firstErr.CompareAndSwap(nil, &err)
-					return
-				}
-				if !ar.vecInto(int64(i), buf) {
-					err := fmt.Errorf("horosvec: arena decode node %d out of range", i)
-					firstErr.CompareAndSwap(nil, &err)
-					return
-				}
-				wr.Rotate(buf, rotated)
-				code, sqNorm, l1Norm := encoder.Encode(rotated)
-				nodes[i] = graphNode{
-					id:     int64(i),
-					extID:  extIDs[i],
-					vec:    nil,
-					code:   code,
-					sqNorm: sqNorm,
-					l1Norm: l1Norm,
-				}
-			}
-		}(batchStart, batchEnd, wRot)
 	}
-	wg.Wait()
-	if err := firstErr.Load(); err != nil {
-		return nil, *err
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	return nodes, nil
+	return saveGraphMeta(tx, medoid, dim, maxDegree, n, centroid, rot)
 }
