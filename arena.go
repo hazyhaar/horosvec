@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"syscall"
 )
 
 // Arène plate fp16 : stockage contigu, pointer-free, en lecture seule, des vecteurs
@@ -30,14 +31,36 @@ const (
 	arenaHeaderSize = 24
 )
 
-// arena est une vue en lecture seule d'un fichier d'arène fp16 chargé en mémoire.
-// Sûr en accès concurrent (immutable après ouverture).
+// arena est une vue en lecture seule d'un fichier d'arène fp16 cartographié en mémoire
+// (mmap MAP_SHARED, PROT_READ). Sûr en accès concurrent (immutable après ouverture).
+//
+// Le mmap maintient les octets fp16 dans le page cache du noyau, hors du tas Go : à
+// l'échelle HNbook (27 Go), lire l'intégralité du fichier en tas (os.ReadFile) était
+// intenable. La cartographie est libérée par close() (munmap) ; tant qu'elle n'est pas
+// libérée, l'espace d'adressage reste réservé mais les pages non touchées ne comptent pas
+// dans le RSS résident.
 type arena struct {
 	dim   int
 	count int64
-	// data contient l'intégralité du fichier (header + payload) ; la charge
-	// utile fp16 commence à arenaHeaderSize.
-	data []byte
+	// data cartographie l'intégralité du fichier (header + payload) ; la charge utile fp16
+	// commence à arenaHeaderSize. Backing = mmap noyau quand mmapped, sinon tas Go.
+	data    []byte
+	mmapped bool
+}
+
+// close libère la cartographie mémoire de l'arène (munmap). Idempotent et sûr à appeler
+// sur une arène nil. Après close, l'arène ne doit plus être lue.
+func (a *arena) close() error {
+	if a == nil || !a.mmapped || a.data == nil {
+		return nil
+	}
+	data := a.data
+	a.data = nil
+	a.mmapped = false
+	if err := syscall.Munmap(data); err != nil {
+		return fmt.Errorf("horosvec: munmap arena: %w", err)
+	}
+	return nil
 }
 
 // float32ToFloat16 convertit un float32 en fp16 (IEEE 754 half), arrondi au plus proche
@@ -326,10 +349,37 @@ func exportArenaFromDB(db *sql.DB, dim int, path string) error {
 // count) est vérifié et la longueur du fichier doit correspondre exactement à
 // header + count × dim × 2.
 func openArena(path string) (*arena, error) {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("horosvec: open arena: %w", err)
 	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("horosvec: open arena: stat: %w", err)
+	}
+	size := st.Size()
+	if size < arenaHeaderSize {
+		return nil, fmt.Errorf("horosvec: open arena: file too short (%d < %d)", size, arenaHeaderSize)
+	}
+	// mmap MAP_SHARED lecture seule : les pages fp16 restent dans le page cache noyau,
+	// jamais copiées dans le tas Go (tenable à 27 Go). L'fd peut être refermé après mmap :
+	// la cartographie survit à la fermeture du descripteur.
+	data, err := syscall.Mmap(int(f.Fd()), 0, int(size), syscall.PROT_READ, syscall.MAP_SHARED)
+	if err != nil {
+		return nil, fmt.Errorf("horosvec: open arena: mmap: %w", err)
+	}
+	a, err := parseArenaHeader(data)
+	if err != nil {
+		_ = syscall.Munmap(data)
+		return nil, err
+	}
+	return a, nil
+}
+
+// parseArenaHeader valide l'en-tête HVARENA1 et la longueur exacte du buffer cartographié,
+// puis renvoie une arène mmap prête à lire. En cas d'erreur, l'appelant libère data.
+func parseArenaHeader(data []byte) (*arena, error) {
 	if len(data) < arenaHeaderSize {
 		return nil, fmt.Errorf("horosvec: open arena: file too short (%d < %d)", len(data), arenaHeaderSize)
 	}
@@ -358,7 +408,7 @@ func openArena(path string) (*arena, error) {
 	if int64(len(data)) != want {
 		return nil, fmt.Errorf("horosvec: open arena: length %d != expected %d (dim=%d count=%d)", len(data), want, dim, count)
 	}
-	return &arena{dim: dim, count: count, data: data}, nil
+	return &arena{dim: dim, count: count, data: data, mmapped: true}, nil
 }
 
 // vecInto décode le vecteur fp16 du nœud nodeID vers dst (len == dim), en fp32.
