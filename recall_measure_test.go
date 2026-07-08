@@ -14,7 +14,17 @@ const (
 	recallMeasureSeed         = 55
 	recallMeasureNumClusters  = 20
 	recallMeasureClusterSigma = 0.05
-	recallMeasureFloor        = 0.50
+
+	// Planchers de rappel par distribution, avec build DÉTERMINISTE (BuildWorkers=1) et graine
+	// fixée : le rappel est alors une constante reproductible sur tout matériel. Valeurs
+	// mesurées à N=2000, dim=128, k=10 : uniform ≈ 0,930, gaussian_clusters ≈ 0,678. Les
+	// planchers sont posés sous ces valeurs avec marge, tout en restant très supérieurs à
+	// l'ancien 0,50 (qui n'assertait rien). Le rappel bien plus bas des clusters gaussiens
+	// serrés (sigma 0,05) est intrinsèque à la quantification RaBitQ 1-bit sur des vecteurs
+	// quasi identiques — pas une régression ; un plancher 0,90 y serait inatteignable sans
+	// changer le comportement de Search.
+	recallMeasureFloorUniform  = 0.90
+	recallMeasureFloorClusters = 0.60
 )
 
 // TestRecallMeasure_VamanaRabitq benchmarks recall@k on Vamana+RaBitQ before M5/M3 arbitration.
@@ -24,14 +34,14 @@ func TestRecallMeasure_VamanaRabitq(t *testing.T) {
 		rng := rand.New(rand.NewPCG(recallMeasureSeed, 0))
 		baseVecs, baseIDs := generateUniformVecs(rng, recallMeasureN, recallMeasureDim)
 		queries := generateUniformQueries(rng, recallMeasureNumQueries, recallMeasureDim)
-		runRecallMeasure(t, "uniform", baseVecs, baseIDs, queries)
+		runRecallMeasure(t, "uniform", baseVecs, baseIDs, queries, recallMeasureFloorUniform)
 	})
 
 	t.Run("gaussian_clusters", func(t *testing.T) {
 		rng := rand.New(rand.NewPCG(recallMeasureSeed, 1))
 		baseVecs, baseIDs := generateClusterVecs(rng, recallMeasureN, recallMeasureDim, recallMeasureNumClusters, recallMeasureClusterSigma)
 		queries := generateClusterQueries(rng, recallMeasureNumQueries, recallMeasureDim, recallMeasureNumClusters, recallMeasureClusterSigma)
-		runRecallMeasure(t, "gaussian_clusters", baseVecs, baseIDs, queries)
+		runRecallMeasure(t, "gaussian_clusters", baseVecs, baseIDs, queries, recallMeasureFloorClusters)
 	})
 }
 
@@ -41,7 +51,7 @@ type recallStats struct {
 	max  float64
 }
 
-func runRecallMeasure(t *testing.T, label string, baseVecs [][]float32, baseIDs [][]byte, queries [][]float32) {
+func runRecallMeasure(t *testing.T, label string, baseVecs [][]float32, baseIDs [][]byte, queries [][]float32, floor float64) {
 	t.Helper()
 
 	exactTopKs := make([]map[string]bool, len(queries))
@@ -55,8 +65,8 @@ func runRecallMeasure(t *testing.T, label string, baseVecs [][]float32, baseIDs 
 		label, cfgDefault.SearchListSize, cfgDefault.EfSearch, cfgDefault.MaxDegree, cfgDefault.BuildPasses,
 		recallMeasureK, statsDefault.mean, statsDefault.min, statsDefault.max,
 		recallMeasureN, recallMeasureNumQueries, recallMeasureDim)
-	if statsDefault.mean < recallMeasureFloor {
-		t.Errorf("[%s] default config: recall@%d mean=%.4f, want >= %.2f", label, recallMeasureK, statsDefault.mean, recallMeasureFloor)
+	if statsDefault.mean < floor {
+		t.Errorf("[%s] default config: recall@%d mean=%.4f, want >= %.2f", label, recallMeasureK, statsDefault.mean, floor)
 	}
 
 	cfgWide := recallMeasureConfig(true)
@@ -65,14 +75,17 @@ func runRecallMeasure(t *testing.T, label string, baseVecs [][]float32, baseIDs 
 		label, cfgWide.SearchListSize, cfgWide.EfSearch, cfgWide.MaxDegree, cfgWide.BuildPasses,
 		recallMeasureK, statsWide.mean, statsWide.min, statsWide.max,
 		recallMeasureN, recallMeasureNumQueries, recallMeasureDim)
-	if statsWide.mean < recallMeasureFloor {
-		t.Errorf("[%s] SearchListSize_x2: recall@%d mean=%.4f, want >= %.2f", label, recallMeasureK, statsWide.mean, recallMeasureFloor)
+	if statsWide.mean < floor {
+		t.Errorf("[%s] SearchListSize_x2: recall@%d mean=%.4f, want >= %.2f", label, recallMeasureK, statsWide.mean, floor)
 	}
 }
 
 func recallMeasureConfig(doubleSearchList bool) Config {
 	cfg := DefaultConfig()
 	cfg.BruteForceThreshold = 0 // force Vamana+RaBitQ path
+	cfg.BuildWorkers = 1        // build séquentiel bit-déterministe (la graine des données ne
+	//                             suffit pas : le build parallèle par défaut interleave et
+	//                             rend le graphe non reproductible — cf. Config.BuildWorkers).
 	if doubleSearchList {
 		cfg.SearchListSize *= 2
 	}

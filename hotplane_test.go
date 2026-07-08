@@ -184,8 +184,8 @@ func TestHotPlane_RecallClustersUnchanged(t *testing.T) {
 
 	cfg := recallMeasureConfig(false)
 	stats := measureRecall(t, baseVecs, baseIDs, queries, exactTopKs, cfg)
-	if stats.mean < recallMeasureFloor {
-		t.Errorf("gaussian_clusters recall@%d mean=%.4f, want >= %.2f (plane must not change results)", recallMeasureK, stats.mean, recallMeasureFloor)
+	if stats.mean < recallMeasureFloorClusters {
+		t.Errorf("gaussian_clusters recall@%d mean=%.4f, want >= %.2f (plane must not change results)", recallMeasureK, stats.mean, recallMeasureFloorClusters)
 	}
 }
 
