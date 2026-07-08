@@ -139,7 +139,10 @@ func (idx *Index) buildFromOpenArena(ctx context.Context, ar *arena, extIDs [][]
 	// aucun tampon O(N×dim). Sémantique identique au chemin fp32 (mêmes valeurs fp16-arrondies).
 	centroidSrc := newArenaVecSource(ar)
 	rotated := make([]float32, idx.codeDim)
-	centroid := make([]float32, idx.codeDim)
+	// Accumulation du centroïde en float64 : une somme naïve float32 sur N vecteurs
+	// dérive par perte d'unité en dessous du plus grand terme. La conversion finale en
+	// float32 préserve le format attendu par l'Encoder sans dégrader la précision de la somme.
+	centroidAcc := make([]float64, idx.codeDim)
 	for i := 0; i < n; i++ {
 		if err := ctx.Err(); err != nil {
 			_ = ar.close()
@@ -152,12 +155,13 @@ func (idx *Index) buildFromOpenArena(ctx context.Context, ar *arena, extIDs [][]
 		}
 		idx.rotator.Rotate(v, rotated)
 		for j, val := range rotated {
-			centroid[j] += val
+			centroidAcc[j] += float64(val)
 		}
 	}
-	invN := float32(1.0 / float64(n))
+	invN := 1.0 / float64(n)
+	centroid := make([]float32, idx.codeDim)
 	for j := range idx.codeDim {
-		centroid[j] *= invN
+		centroid[j] = float32(centroidAcc[j] * invN)
 	}
 
 	idx.encoder = NewEncoder(centroid)

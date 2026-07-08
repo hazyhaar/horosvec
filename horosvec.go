@@ -413,16 +413,20 @@ func (idx *Index) Build(ctx context.Context, iter VectorIterator) error {
 	idx.codeDim = idx.rotator.CodeDim()
 
 	rotated := make([]float32, idx.codeDim)
-	centroid := make([]float32, idx.codeDim)
+	// Accumulation du centroïde en float64 : une somme naïve float32 sur N vecteurs
+	// dérive par perte d'unité en dessous du plus grand terme. La conversion finale en
+	// float32 préserve le format attendu par l'Encoder sans dégrader la précision de la somme.
+	centroidAcc := make([]float64, idx.codeDim)
 	for _, v := range allVecs {
 		idx.rotator.Rotate(v, rotated)
 		for j, val := range rotated {
-			centroid[j] += val
+			centroidAcc[j] += float64(val)
 		}
 	}
-	invN := float32(1.0 / float64(len(allVecs)))
+	invN := 1.0 / float64(len(allVecs))
+	centroid := make([]float32, idx.codeDim)
 	for j := range idx.codeDim {
-		centroid[j] *= invN
+		centroid[j] = float32(centroidAcc[j] * invN)
 	}
 
 	idx.encoder = NewEncoder(centroid)
@@ -1310,16 +1314,20 @@ func (idx *Index) rebuildInternal(ctx context.Context, iter VectorIterator) {
 	}
 
 	rotated := make([]float32, idx.codeDim)
-	centroid := make([]float32, idx.codeDim)
+	// Accumulation du centroïde en float64 : une somme naïve float32 sur N vecteurs
+	// dérive par perte d'unité en dessous du plus grand terme. La conversion finale en
+	// float32 préserve le format attendu par l'Encoder sans dégrader la précision de la somme.
+	centroidAcc := make([]float64, idx.codeDim)
 	for _, v := range allVecs {
 		idx.rotator.Rotate(v, rotated)
 		for j, val := range rotated {
-			centroid[j] += val
+			centroidAcc[j] += float64(val)
 		}
 	}
-	invN := float32(1.0 / float64(len(allVecs)))
+	invN := 1.0 / float64(len(allVecs))
+	centroid := make([]float32, idx.codeDim)
 	for j := range idx.codeDim {
-		centroid[j] *= invN
+		centroid[j] = float32(centroidAcc[j] * invN)
 	}
 
 	enc := NewEncoder(centroid)
