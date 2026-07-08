@@ -571,7 +571,7 @@ func (idx *Index) buildStreamingArena(ctx context.Context, iter VectorIterator) 
 	if err != nil {
 		return err
 	}
-	return idx.buildFromOpenArena(ctx, ar, allIDs)
+	return idx.buildFromOpenArena(ctx, ar, allIDs, idx.vamanaGraphBuilder(ar))
 }
 
 // Search finds the topK nearest neighbors.

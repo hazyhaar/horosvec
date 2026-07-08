@@ -412,6 +412,26 @@ func (s *flatNeighborStore) unlock(id int64) {
 
 func (s *flatNeighborStore) degree(id int64) int { return int(s.deg[id]) }
 
+func (s *flatNeighborStore) neighborStride() int { return s.stride }
+
+// neighborLoader abstrait la source d'adjacence lue en persistance streaming
+// (saveGraphStreamArena) : soit une arène plate en RAM issue du build Vamana
+// (flatNeighborStore), soit une adjacence externe mmap issue d'un build GPU
+// (adjReader, cf. arena_import.go). loadInto recopie les voisins du nœud id dans
+// dst (typiquement dst[:0], détenu par l'appelant) et renvoie la slice remplie ;
+// neighborStride borne la capacité du tampon de lecture.
+type neighborLoader interface {
+	loadInto(id int64, dst []int64) []int64
+	neighborStride() int
+}
+
+// graphBuilder produit la source d'adjacence d'un index à partir d'une arène mmap
+// ouverte et du médoïde déjà calculé, plus une fonction de libération appelée après
+// la persistance (GC de l'arène plate de build, ou munmap de l'adjacence externe).
+// Deux implémentations : la construction Vamana (buildFromOpenArena standard) et
+// l'import d'adjacence externe (ImportAdjacency).
+type graphBuilder func(ctx context.Context, n int, medoid int64) (neighborLoader, func(), error)
+
 // loadInto ajoute les voisins du nœud id à dst (typiquement dst[:0], détenu par l'appelant)
 // et renvoie la slice remplie. L'appelant DOIT détenir lock(id) sur le chemin parallèle.
 func (s *flatNeighborStore) loadInto(id int64, dst []int64) []int64 {

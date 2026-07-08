@@ -94,7 +94,23 @@ func (idx *Index) BuildFromArena(ctx context.Context, arenaPath, idsPath string)
 		return fmt.Errorf("horosvec: BuildFromArena: ids count %d != arena count %d", len(extIDs), ar.count)
 	}
 	idx.cfg.ArenaPath = arenaPath
-	return idx.buildFromOpenArena(ctx, ar, extIDs)
+	return idx.buildFromOpenArena(ctx, ar, extIDs, idx.vamanaGraphBuilder(ar))
+}
+
+// vamanaGraphBuilder renvoie le graphBuilder standard : construction Vamana dans une arène
+// plate en RAM (flatNeighborStore), en lisant les vecteurs à la demande depuis l'arène mmap.
+// La libération est un no-op explicite : l'arène plate est un objet du tas Go, récupérée par
+// le GC dès que buildFromOpenArena annule sa référence.
+func (idx *Index) vamanaGraphBuilder(ar *arena) graphBuilder {
+	return func(ctx context.Context, n int, medoid int64) (neighborLoader, func(), error) {
+		buildWorkers := effectiveBuildWorkers(idx.cfg)
+		store, err := buildGraphStore(ctx, n, newArenaVecSource(ar), medoid,
+			idx.cfg.MaxDegree, idx.cfg.SearchListSize, idx.cfg.Alpha, idx.cfg.BuildPasses, buildWorkers)
+		if err != nil {
+			return nil, nil, err
+		}
+		return store, func() {}, nil
+	}
 }
 
 // buildFromOpenArena est le cœur mémoire-borné partagé par BuildFromArena et par le chemin
@@ -105,7 +121,7 @@ func (idx *Index) BuildFromArena(ctx context.Context, arenaPath, idsPath string)
 //
 // L'appelant DOIT détenir idx.mu.Lock. buildFromOpenArena prend possession de ar : il le ferme
 // en cas d'erreur, ou le conserve comme arène de rerank en cas de succès.
-func (idx *Index) buildFromOpenArena(ctx context.Context, ar *arena, extIDs [][]byte) error {
+func (idx *Index) buildFromOpenArena(ctx context.Context, ar *arena, extIDs [][]byte, gb graphBuilder) error {
 	n := int(ar.count)
 	if n != len(extIDs) {
 		_ = ar.close()
@@ -178,18 +194,27 @@ func (idx *Index) buildFromOpenArena(ctx context.Context, ar *arena, extIDs [][]
 	}
 	idx.centroid.SnapshotBuild()
 
-	buildWorkers := effectiveBuildWorkers(idx.cfg)
 	idx.medoid = findMedoidSource(n, dim, newArenaVecSource(ar))
 
-	// Construction de l'adjacence dans une arène plate (flatNeighborStore) : aucun graphNode,
-	// aucune tranche de voisins par nœud, aucun code RaBitQ résident pendant la construction.
+	// Source d'adjacence : soit la construction Vamana (arène plate flatNeighborStore, aucun
+	// graphNode ni tranche de voisins par nœud), soit une adjacence externe mmap (import GPU).
 	// Les codes/normes sont encodés à la volée au moment de la persistance (streaming).
-	store, err := buildGraphStore(ctx, n, newArenaVecSource(ar), idx.medoid,
-		idx.cfg.MaxDegree, idx.cfg.SearchListSize, idx.cfg.Alpha, idx.cfg.BuildPasses, buildWorkers)
+	store, rawCleanup, err := gb(ctx, n, idx.medoid)
 	if err != nil {
 		_ = ar.close()
 		return err
 	}
+	// cleanup est idempotent : libère la source d'adjacence (GC de l'arène plate de build, ou
+	// munmap de l'adjacence externe) une seule fois, qu'on sorte en succès ou par une erreur
+	// intermédiaire (le defer couvre les chemins d'erreur, l'appel explicite le chemin nominal).
+	cleaned := false
+	cleanup := func() {
+		if !cleaned {
+			cleaned = true
+			rawCleanup()
+		}
+	}
+	defer cleanup()
 
 	// Persist : SQLite allégé (vector-less) — l'arène est la source des vecteurs bruts.
 	tx, err := idx.db.BeginTx(ctx, nil)
@@ -238,8 +263,9 @@ func (idx *Index) buildFromOpenArena(ctx context.Context, ar *arena, extIDs [][]
 	idx.flatIDs = nil
 	idx.cache.clear()
 
-	// Libère l'arène plate d'adjacence transitoire avant de bâtir le plan chaud, puis paie la
+	// Libère la source d'adjacence transitoire avant de bâtir le plan chaud, puis paie la
 	// collecte des déchets au moment froid et déterministe.
+	cleanup()
 	store = nil
 	runtime.GC()
 
@@ -268,7 +294,7 @@ func (idx *Index) buildFromOpenArena(ctx context.Context, ar *arena, extIDs [][]
 func saveGraphStreamArena(
 	ctx context.Context,
 	tx *sql.Tx,
-	store *flatNeighborStore,
+	store neighborLoader,
 	rotator *Rotator,
 	encoder *Encoder,
 	ar *arena,
@@ -284,7 +310,7 @@ func saveGraphStreamArena(
 	}
 	rotated := make([]float32, rotator.CodeDim())
 	buf := make([]float32, dim)
-	nbrBuf := make([]int64, 0, store.stride)
+	nbrBuf := make([]int64, 0, store.neighborStride())
 	for i := 0; i < n; i++ {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("horosvec: %w", err)
