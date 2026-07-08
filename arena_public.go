@@ -86,3 +86,11 @@ func (r *ArenaReader) Count() int64 { return r.a.count }
 // VecInto décode le vecteur de rang i (fp16→fp32) vers dst (len == Dim). Retourne false si
 // i est hors bornes.
 func (r *ArenaReader) VecInto(i int64, dst []float32) bool { return r.a.vecInto(i, dst) }
+
+// VerifyNormalized échantillonne sampleN vecteurs de l'arène (tirage déterministe de graine
+// seed, avec remise) et renvoie une erreur si moins de 99,9 % d'entre eux sont unitaires
+// (|‖v‖₂−1| < 0,01). Oracle métrique de la voie d'import : une adjacence bâtie en produit
+// scalaire (CAGRA) ne se classe comme une marche L2 (horosvec) que sur des vecteurs normés.
+func (r *ArenaReader) VerifyNormalized(sampleN int, seed uint64) error {
+	return verifyArenaNormalized(r.a, sampleN, seed)
+}
