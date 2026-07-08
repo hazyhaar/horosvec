@@ -297,7 +297,7 @@ func New(db *sql.DB, cfg Config) (*Index, error) {
 
 		// Guard against stale medoid (e.g. node deleted or incremental inserts
 		// added new nodes without recomputing). Recompute and persist if needed.
-		refreshed, err := checkAndRefreshMedoid(db, medoid)
+		refreshed, err := idx.checkAndRefreshMedoid(medoid)
 		if err != nil {
 			return nil, fmt.Errorf("horosvec: validate medoid: %w", err)
 		}
@@ -573,7 +573,10 @@ func (idx *Index) buildStreamingArena(ctx context.Context, iter VectorIterator) 
 // Search finds the topK nearest neighbors.
 // For small indices (<= BruteForceThreshold): exact brute-force scan, 100% recall.
 // For large indices: 2-stage RaBitQ beam search + L2 rerank.
-// RLock allows concurrent Search but not Insert. vamanaSearch uses idx.nextID as bitset capacity — if Insert grows nextID concurrently, bitset undersized.
+// Search prend idx.mu.RLock, Insert prend idx.mu.Lock : les deux s'excluent mutuellement.
+// vamanaSearch dimensionne le bitset des nœuds visités sur idx.nextID ; comme Insert ne peut
+// pas s'exécuter tant qu'une Search détient le RLock, nextID ne peut pas croître pendant la
+// recherche et le bitset est toujours correctement dimensionné. Aucune course ici.
 func (idx *Index) Search(ctx context.Context, query []float32, topK int) ([]Result, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("horosvec: %w", err)
@@ -819,7 +822,12 @@ func (idx *Index) rabitqGreedySearch(ctx context.Context, query []float32, beamW
 
 // rabitqGreedySearchInternal performs beam search with an optional node loader and capacity.
 // When loadFn is nil, committed nodes are loaded via loadNodeReadOnly.
-// Acquires searchState from sync.Pool. If panic before defer release, state leaked. Pool may return dirty state from previous query.
+// Acquiert un searchState depuis sync.Pool ; le defer releaseSearchState suit immédiatement et
+// s'exécute même en cas de panic (déroulé de pile), donc aucune fuite en pratique. maxNodes
+// vaut idx.nextID, capacité du bitset des visités : l'appelant tient idx.mu.RLock, nextID est
+// figé pendant la recherche (Insert exige le Lock exclusif) et la capacité ne peut être
+// sous-dimensionnée. acquireSearchState réinitialise l'état emprunté (bitset effacé, tas et
+// liste tronqués, tampons redimensionnés) — aucun résidu de la requête précédente.
 func (idx *Index) rabitqGreedySearchInternal(ctx context.Context, query []float32, beamWidth int, maxNodes int64, loadFn func(int64) (*cachedNode, error)) ([]searchCandidate, error) {
 	state := acquireSearchState(maxNodes, beamWidth, idx.codeDim)
 	defer releaseSearchState(state)
@@ -1197,7 +1205,7 @@ func (idx *Index) Insert(ctx context.Context, vecs [][]float32, ids [][]byte) er
 	// Recompute medoid when too many nodes have been added since last build/recompute.
 	// Two triggers: periodic (MedoidStaleThreshold) or >50% new nodes relative to total.
 	if idx.shouldRefreshMedoid(int64(count)) {
-		newMedoid, err := recomputeMedoid(idx.db)
+		newMedoid, err := idx.recomputeMedoid()
 		if err != nil {
 			slog.Warn("horosvec: medoid recompute after insert failed", "err", err)
 		} else {
