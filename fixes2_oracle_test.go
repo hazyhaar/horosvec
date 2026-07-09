@@ -228,35 +228,41 @@ func TestO3_NodeCountMetaReconciledGovernsLoadDecision(t *testing.T) {
 
 // --- A1 : node_count meta stays == COUNT(*) after a successful insert (written in tx) ---
 
-func TestA1_NodeCountMetaConsistentAfterInsert(t *testing.T) {
+// TestA1_NodeCountMetaWrittenInsideTx exerce le MÉCANISME différenciant d'A1 : l'atomicité.
+// Via le hook testBeforeInsertCommit, on lit node_count DANS la transaction, avant Commit. Après
+// A1, la méta y vaut déjà le nouveau compte (60+10=70). Sur HEAD, la méta n'était écrite qu'en
+// post-commit (best-effort, hors tx) → dans la tx elle valait encore l'ancien compte (60) :
+// rouge-avant. Un test de simple consistance d'état final serait satisfait par les deux versions
+// (l'ancien post-commit écrivait aussi méta=COUNT(*)) et ne prouverait pas l'atomicité.
+func TestA1_NodeCountMetaWrittenInsideTx(t *testing.T) {
 	dim := 16
-	dbPath, db, idx := buildFileIndex(t, 60, dim, 5)
-	// Insert quelques vecteurs.
+	_, _, idx := buildFileIndex(t, 60, dim, 5)
+	defer idx.Close()
+
+	const wantInTx = int64(70) // 60 + 10
+	var seenInTx int64 = -1
+	idx.testBeforeInsertCommit = func(tx *sql.Tx) {
+		var raw []byte
+		if err := tx.QueryRow("SELECT value FROM vindex_meta WHERE key='node_count'").Scan(&raw); err != nil {
+			t.Errorf("A1: read node_count in tx: %v", err)
+			return
+		}
+		seenInTx = deserializeInt64(raw)
+	}
+	defer func() { idx.testBeforeInsertCommit = nil }()
+
 	rng := rand.New(rand.NewPCG(99, 0))
 	vecs, ids := generateVecs(rng, 10, dim)
+	// ext_ids distincts de ceux du build (0..59) : ext_id est UNIQUE, un doublon
+	// déclencherait un REPLACE et le compte n'augmenterait pas (artefact de test).
+	for i := range ids {
+		ids[i] = []byte{0xFF, byte(i)}
+	}
 	if err := idx.Insert(context.Background(), vecs, ids); err != nil {
 		t.Fatal(err)
 	}
-	idx.Close()
-	db.Close()
-
-	dsn := "file:" + dbPath + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
-	db2, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db2.Close()
-	metaBytes, err := loadMeta(db2, "node_count")
-	if err != nil {
-		t.Fatal(err)
-	}
-	metaCount := deserializeInt64(metaBytes)
-	real, err := getNodeCount(db2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if metaCount != int64(real) {
-		t.Fatalf("A1: node_count meta %d != COUNT(*) %d after insert", metaCount, real)
+	if seenInTx != wantInTx {
+		t.Fatalf("A1: node_count inside tx before commit = %d, want %d (meta must be written in the tx, atomically with the nodes)", seenInTx, wantInTx)
 	}
 }
 
