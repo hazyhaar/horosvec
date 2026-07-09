@@ -126,7 +126,50 @@ known evolution, see backlog).
 - Never truncate embedding inputs to a model's exact context window
   (vLLM pooling scheduler race at full window; keep ~200 tokens of margin).
 
-## 9. Known limits / backlog (engraved, not hidden)
+## 9. Why horosvec is not on ann-benchmarks (a deliberate non-submission)
+
+ann-benchmarks is the reference leaderboard of the ANN field, and horosvec is
+deliberately absent from it — not because the numbers would be embarrassing,
+but because **the benchmark and this engine measure orthogonal things**. Being
+explicit about that orthogonality matters more than a leaderboard position.
+
+What ann-benchmarks measures: the recall/throughput Pareto front of an
+**in-memory index**, driven by a **single sequential client**, on standard
+datasets that are mostly **low-to-mid dimensional** (SIFT-128, GloVe-100/200).
+That protocol isolates the algorithmic kernel — and on that axis the honest
+expectation is known and measured: a C++ graph over resident fp32 vectors
+(hnswlib) beats horosvec ~×2 single-client, and ~×5 at iso-recall on 128-dim
+data, where 1-bit-per-dimension codes simply carry too few bits.
+
+What horosvec is built for — and what that protocol structurally cannot see:
+
+- **Concurrent serving.** Under 32 closed-loop clients on a real 512-dim
+  corpus (1M qwen embeddings), horosvec sustains ×1.9 the throughput of
+  hnswlib at every sweep point, at higher recall at every point (measured
+  2026-07-09, harness and JSONL in horosvec-bench). ann-benchmarks runs one
+  query at a time; this axis does not exist there.
+- **Persistence and memory envelope.** A horosvec index is a SQLite file plus
+  an fp16 mmap arena: it opens without a rebuild, survives restarts, and
+  serves 26.7M vectors with ~14 GB of heap because the vectors live off-heap.
+  ann-benchmarks assumes the index fits in RAM as a process-lifetime object;
+  durability and heap discipline are out of scope.
+- **High-dimensional real embeddings.** The 1-bit quantization pays off
+  precisely where modern embedding models live (512-1024+ dims) — the regime
+  underrepresented in the standard datasets.
+- **Zero native dependencies.** Pure Go, static binaries. The submission
+  itself would have required wrapping the engine in a cgo shared library —
+  benchmarking a build configuration the project explicitly refuses.
+
+A leaderboard entry that ranked horosvec on the single-client, in-RAM,
+low-dimension axis would be a *true measurement of the wrong object* — the
+same failure mode this project's own benchmark campaign documented and
+corrected twice (a rotational disk measured as engine latency; a non-production
+code path measured as the engine). The comparative numbers horosvec publishes
+instead (see `README.md` and the bench harness) state their exact perimeter:
+corpus, dimension, concurrency, storage medium, code path — including the
+configurations where hnswlib wins.
+
+## 10. Known limits / backlog (engraved, not hidden)
 
 - No online writes at scale: arena mode is build-once/serve-many (appendable
   arena + shadow rebuild are designed, not built).

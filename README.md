@@ -71,6 +71,14 @@ force over the full arena):
 Latency is medium-dominated: the same index served from a rotational disk
 measures p50 ≈ 2.9 s. Keep arenas on SSD/NVMe.
 
+**Why no ann-benchmarks entry.** The reference leaderboard measures a
+single-client, in-RAM, mostly low-dimension protocol — orthogonal to what this
+engine is built for (concurrent serving, SQLite persistence, off-heap fp16
+vectors, high-dim real embeddings). On their axis, hnswlib wins ~×2
+single-client and ~×5 at iso-recall on 128-dim data — measured and published
+here rather than hidden. On the axes they cannot see, the numbers above apply.
+Rationale in full: `docs/ARCHITECTURE.md` §9.
+
 **Conformity note.** The asymmetric RaBitQ estimator was audited line-by-line
 against the paper (2026-07-08): the implementation is the canonical unbiased
 estimator — the √d and ‖q‖ factors cancel algebraically and the L1 division is
