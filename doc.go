@@ -68,6 +68,13 @@
 //     graph path and budget memory accordingly.
 //   - PRAGMA tuning applies per pooled connection; see pragma.go if you
 //     manage the *sql.DB pool yourself.
+//   - The pointer-free hot plane (hotPlane) indexes neighbor and ext_id
+//     offsets with int32. The cumulative number of neighbors (N times degree)
+//     and the cumulative ext_id byte length must each stay below 2^31; the
+//     practical ceiling is roughly 33M nodes at degree 64. Building, loading
+//     or importing an index past that limit fails loudly (checkInt32Offset)
+//     rather than truncating an offset and corrupting the slicing — shard the
+//     corpus across several indexes instead.
 //
 // # Performance and GC at scale
 //
