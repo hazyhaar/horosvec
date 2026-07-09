@@ -248,6 +248,19 @@ type Index struct {
 	// la boucle de rerank. Avec une arène active couvrant tous les nœuds, ce
 	// compteur reste à 0 (critère C2). Instrumentation d'observabilité.
 	rerankSQLLoads atomic.Int64
+
+	// degradedNeighborLoads compte les voisins ignorés en marche greedy faute de lecture
+	// code/normes (nœud isolé corrompu, A3). Dégradation TOLÉRÉE : un nœud cassé ne tue pas
+	// Search — contrairement au médoïde, dont l'illisibilité est une erreur dure. Fail-soft.
+	degradedNeighborLoads atomic.Int64
+	// planeDegraded compte les échecs d'extension du plan chaud après un Insert commité (A5).
+	// Le plan est invalidé (reconstruit au prochain build) et le repli SQL/cache reste correct :
+	// dégradation d'observabilité, pas de perte de correction. Fail-soft.
+	planeDegraded atomic.Int64
+	// malformedVectorSkips compte les blobs vecteur de longueur != dim*4 rencontrés sur un
+	// chemin de désérialisation non fiable (repli rerank SQL, brute-force SQLite, A4) : la ligne
+	// est sautée au lieu de faire paniquer l2DistanceSquared (slicing hors borne). Fail-soft.
+	malformedVectorSkips atomic.Int64
 }
 
 // RerankSQLLoads retourne le nombre cumulé de chargements SQL déclenchés par l'étape
@@ -255,6 +268,24 @@ type Index struct {
 // reste à 0 (aucun accès SQL, aucune pollution du cache LRU sur le chemin chaud).
 func (idx *Index) RerankSQLLoads() int64 {
 	return idx.rerankSQLLoads.Load()
+}
+
+// DegradedNeighborLoads retourne le nombre cumulé de voisins ignorés en marche greedy
+// pour cause de nœud illisible (A3). > 0 signale une corruption locale tolérée, jamais fatale.
+func (idx *Index) DegradedNeighborLoads() int64 {
+	return idx.degradedNeighborLoads.Load()
+}
+
+// PlaneDegraded retourne le nombre cumulé d'échecs d'extension du plan chaud après Insert (A5).
+// > 0 signale que le plan a été invalidé et sera reconstruit ; le repli SQL/cache reste correct.
+func (idx *Index) PlaneDegraded() int64 {
+	return idx.planeDegraded.Load()
+}
+
+// MalformedVectorSkips retourne le nombre cumulé de lignes vecteur sautées faute de conformité
+// de longueur sur un chemin non fiable (A4). > 0 signale des blobs corrompus/désalignés en base.
+func (idx *Index) MalformedVectorSkips() int64 {
+	return idx.malformedVectorSkips.Load()
 }
 
 // New creates or loads an Index from the given database.
@@ -290,10 +321,15 @@ func New(db *sql.DB, cfg Config) (*Index, error) {
 		idx.centroid.SetBuildCentroid(centroid, vectorsAtBuild)
 		idx.built = true
 
+		// A2 : l'échec de getMaxNodeID (table illisible/DB corrompue) est propagé — jamais un
+		// index « chargé » avec nextID=0, qui ferait réécrire les nœuds existants au prochain
+		// Insert. L'ancien `if err == nil` avalait l'erreur et laissait un index silencieusement
+		// faux.
 		maxID, err := getMaxNodeID(db)
-		if err == nil {
-			idx.nextID = maxID + 1
+		if err != nil {
+			return nil, fmt.Errorf("horosvec: load max node id: %w", err)
 		}
+		idx.nextID = maxID + 1
 
 		// Guard against stale medoid (e.g. node deleted or incremental inserts
 		// added new nodes without recomputing). Recompute and persist if needed.
@@ -351,7 +387,16 @@ func (idx *Index) loadFlatVectors() {
 		if err := rows.Scan(&extID, &vecBlob); err != nil {
 			return
 		}
-		vec := deserializeFloat32s(vecBlob)
+		vec, ok := vecFromBlobChecked(vecBlob, idx.dim)
+		if !ok {
+			// A4 : un blob court désaligne TOUT flatVecs (le slicing i*dim..(i+1)*dim
+			// dans bruteForceFlat lirait alors les vecteurs voisins). Fail-loud : on
+			// DÉSACTIVE le flat (flatVecs reste nil, non assigné) — bruteForceSearch
+			// retombera sur SQLite/arène, jamais sur un tableau silencieusement faux.
+			slog.Warn("horosvec: flat vectors disabled: malformed vector blob at load",
+				"blob_len", len(vecBlob), "want", idx.dim*4)
+			return
+		}
 		flatVecs = append(flatVecs, vec...)
 		flatIDs = append(flatIDs, extID)
 	}
@@ -615,27 +660,37 @@ func (idx *Index) Search(ctx context.Context, query []float32, topK int) ([]Resu
 // falls back to SQL scan otherwise.
 func (idx *Index) bruteForceSearch(ctx context.Context, query []float32, topK int) ([]Result, error) {
 	if idx.flatVecs != nil {
-		return idx.bruteForceFlat(query, topK), nil
+		return idx.bruteForceFlat(ctx, query, topK)
 	}
 	// Mode arène (SQLite vector-less) : les blobs vecteur sont vides ; la source des
 	// vecteurs est l'arène fp16. Sans ce routage, bruteForceSQLite lirait des blobs vides
 	// et l2DistanceSquared paniquerait.
 	if idx.arena != nil {
-		return idx.bruteForceArena(query, topK), nil
+		return idx.bruteForceArena(ctx, query, topK)
 	}
 	return idx.bruteForceSQLite(ctx, query, topK)
 }
 
+// bruteForceCtxCheckStride borne la fréquence des sondes ctx.Err() sur le chemin chaud du
+// scan exhaustif (B2) : une sonde toutes les ~4096 itérations, jamais à chaque tour (le coût
+// d'un select/atomic par vecteur dominerait un calcul de distance L2 sur petit corpus).
+const bruteForceCtxCheckStride = 4096
+
 // bruteForceArena scanne exactement tous les vecteurs depuis l'arène fp16 (100 % rappel).
 // Utilisé quand l'index est en mode arène (SQLite sans blob vecteur) et sous le seuil
 // force-brute. Les ext_ids sont résolus depuis le plan chaud (couverture dense garantie).
-func (idx *Index) bruteForceArena(query []float32, topK int) []Result {
+func (idx *Index) bruteForceArena(ctx context.Context, query []float32, topK int) ([]Result, error) {
 	n := int(idx.arena.count)
 	buf := make([]float32, idx.dim)
 	best := make([]Result, 0, topK+1)
 	worstDist := math.MaxFloat64
 
 	for i := 0; i < n; i++ {
+		if i%bruteForceCtxCheckStride == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, fmt.Errorf("horosvec: brute force arena: %w", err)
+			}
+		}
 		if !idx.arena.vecInto(int64(i), buf) {
 			continue
 		}
@@ -655,17 +710,22 @@ func (idx *Index) bruteForceArena(query []float32, topK int) []Result {
 			worstDist = best[len(best)-1].Score
 		}
 	}
-	return best
+	return best, nil
 }
 
 // bruteForceFlat scans contiguous in-memory vectors. Zero allocs on hot path.
-func (idx *Index) bruteForceFlat(query []float32, topK int) []Result {
+func (idx *Index) bruteForceFlat(ctx context.Context, query []float32, topK int) ([]Result, error) {
 	n := len(idx.flatIDs)
 	dim := idx.dim
 	best := make([]Result, 0, topK+1)
 	worstDist := math.MaxFloat64
 
 	for i := range n {
+		if i%bruteForceCtxCheckStride == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, fmt.Errorf("horosvec: brute force flat: %w", err)
+			}
+		}
 		vec := idx.flatVecs[i*dim : (i+1)*dim]
 		d := l2DistanceSquared(query, vec)
 
@@ -678,7 +738,7 @@ func (idx *Index) bruteForceFlat(query []float32, topK int) []Result {
 			worstDist = best[len(best)-1].Score
 		}
 	}
-	return best
+	return best, nil
 }
 
 // bruteForceSQLite scans all vectors from the database. Used when flat vectors aren't available.
@@ -700,7 +760,13 @@ func (idx *Index) bruteForceSQLite(ctx context.Context, query []float32, topK in
 		if err := rows.Scan(&extID, &vecBlob); err != nil {
 			continue
 		}
-		vec := deserializeFloat32s(vecBlob)
+		vec, ok := vecFromBlobChecked(vecBlob, idx.dim)
+		if !ok {
+			// A4 : blob non conforme (corruption/vector-less) → ligne sautée + compteur,
+			// jamais une panique de l2DistanceSquared sur slicing hors borne.
+			idx.malformedVectorSkips.Add(1)
+			continue
+		}
 		d := l2DistanceSquared(query, vec)
 
 		if len(best) < topK || d < worstDist {
@@ -776,6 +842,14 @@ func (idx *Index) vamanaSearch(ctx context.Context, query []float32, topK int) (
 			candidates[i].dist = math.MaxFloat64
 			continue
 		}
+		// A4 : un vecteur reconstitué de longueur != dim (blob corrompu/désaligné) ferait
+		// paniquer l2DistanceSquared. Candidat écarté (dist maximale) + compteur, sans
+		// assertion dans le chemin chaud lui-même.
+		if len(node.vec) != idx.dim {
+			candidates[i].dist = math.MaxFloat64
+			idx.malformedVectorSkips.Add(1)
+			continue
+		}
 		candidates[i].dist = l2DistanceSquared(query, node.vec)
 	}
 	sortCandidates(candidates)
@@ -848,7 +922,10 @@ func (idx *Index) rabitqGreedySearchInternal(ctx context.Context, query []float3
 
 	medoidCode, medoidSq, medoidL1, err := idx.greedyNodeCodeNorms(ctx, idx.medoid, loadFn)
 	if err != nil {
-		return nil, nil
+		// A3 : le médoïde est le point d'entrée UNIQUE de la marche greedy. Illisible, la
+		// recherche ne peut rien produire de valide : erreur dure propagée (vrai signal d'index
+		// cassé), jamais un `return nil, nil` qui rendait un [] indistinct d'un corpus vide.
+		return nil, fmt.Errorf("horosvec: greedy search: unreadable medoid node %d: %w", idx.medoid, err)
 	}
 	state.visit(idx.medoid)
 
@@ -879,6 +956,11 @@ func (idx *Index) rabitqGreedySearchInternal(ctx context.Context, query []float3
 
 			nbrCode, nbrSq, nbrL1, err := idx.greedyNodeCodeNorms(ctx, nbr, loadFn)
 			if err != nil {
+				// A3 : un nœud VOISIN illisible est une dégradation TOLÉRÉE (un nœud isolé
+				// corrompu ne doit pas tuer Search, contrairement au médoïde). Le voisin est
+				// ignoré, mais l'incident est compté et journalisé — jamais avalé en silence.
+				idx.degradedNeighborLoads.Add(1)
+				slog.Warn("horosvec: greedy search skipped unreadable neighbor", "node", nbr, "err", err)
 				return true
 			}
 
@@ -1175,6 +1257,22 @@ func (idx *Index) Insert(ctx context.Context, vecs [][]float32, ids [][]byte) er
 		pendingCentroidVecs = append(pendingCentroidVecs, vec)
 	}
 
+	// A1 : le node_count est persisté DANS la transaction, avant le commit. Données et
+	// métadonnée deviennent atomiques — un crash entre l'écriture des nœuds et celle du
+	// compteur est désormais impossible par construction (une seule tx). L'ancienne écriture
+	// post-commit best-effort (getNodeCount + écriture méta, erreurs avalées) pouvait
+	// laisser une méta désynchronisée si le process mourait juste après le Commit.
+	var count int64
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM vindex_nodes").Scan(&count); err != nil {
+		return fmt.Errorf("horosvec: count nodes in tx: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		"INSERT OR REPLACE INTO vindex_meta (key, value) VALUES (?, ?)",
+		"node_count", serializeInt64(count),
+	); err != nil {
+		return fmt.Errorf("horosvec: update node_count in tx: %w", err)
+	}
+
 	if idx.testBeforeInsertCommit != nil {
 		idx.testBeforeInsertCommit(tx)
 	}
@@ -1203,12 +1301,10 @@ func (idx *Index) Insert(ctx context.Context, vecs [][]float32, ids [][]byte) er
 
 	idx.insertedSinceMedoid += int64(len(vecs))
 
-	count, _ := getNodeCount(idx.db)
-	_ = updateNodeCountInt64(idx.db, int64(count))
-
 	// Recompute medoid when too many nodes have been added since last build/recompute.
 	// Two triggers: periodic (MedoidStaleThreshold) or >50% new nodes relative to total.
-	if idx.shouldRefreshMedoid(int64(count)) {
+	// count est le COUNT(*) calculé dans la tx (A1), désormais fiable.
+	if idx.shouldRefreshMedoid(count) {
 		newMedoid, err := idx.recomputeMedoid()
 		if err != nil {
 			slog.Warn("horosvec: medoid recompute after insert failed", "err", err)

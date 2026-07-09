@@ -24,6 +24,17 @@ func deserializeFloat32s(buf []byte) []float32 {
 	return vals
 }
 
+// vecFromBlobChecked désérialise un blob vecteur et vérifie qu'il porte EXACTEMENT dim
+// valeurs (len == dim*4). Un blob court, vide ou désaligné (corruption, SQLite vector-less)
+// renvoie ok=false : l'appelant SAUTE la ligne au lieu de faire paniquer l2DistanceSquared
+// sur un accès hors borne (A4). Le chemin chaud reste sans assertion — la garde est ici.
+func vecFromBlobChecked(buf []byte, dim int) ([]float32, bool) {
+	if dim <= 0 || len(buf) != dim*4 {
+		return nil, false
+	}
+	return deserializeFloat32s(buf), true
+}
+
 // serializeInt64s encodes a slice of int64 values into a byte slice (little-endian).
 func serializeInt64s(vals []int64) []byte {
 	buf := make([]byte, len(vals)*8)
