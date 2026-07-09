@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 )
 
 // hotPlane : vue contiguë et pointer-free des nœuds persistés, pour la boucle chaude.
@@ -23,6 +24,21 @@ type hotPlane struct {
 
 func codeBytesForDim(codeDim int) int {
 	return (codeDim + 7) / 8
+}
+
+// maxInt32Offset est la plus grande valeur représentable dans un offset int32 du plan chaud.
+const maxInt32Offset = int64(^uint32(0) >> 1) // 2^31 - 1
+
+// checkInt32Offset refuse fail-loud un cumul (nombre total de voisins N×degré, ou octets
+// cumulés d'ext_ids) qui dépasserait la capacité d'un offset int32 du plan chaud (B3). Au-delà,
+// la troncature int32(len(...)) produirait un offset négatif/faux et un slicing corrompu.
+// Limite pratique : ~33M nœuds à degré 64 (2^31 / 64), documentée dans doc.go et ARCHITECTURE §9.
+func checkInt32Offset(cumulative int64, what string) error {
+	if cumulative > maxInt32Offset {
+		return fmt.Errorf("horosvec: hot plane %s cumulative offset %d exceeds int32 capacity %d "+
+			"(~33M nodes at degree 64) — rebuild with a sharded index", what, cumulative, maxInt32Offset)
+	}
+	return nil
 }
 
 // buildHotPlane charge tous les nœuds persistés en un seul SELECT ordonné par node_id.
@@ -89,15 +105,23 @@ func (p *hotPlane) appendRow(code []byte, sqNorm, l1Norm float64, extID []byte, 
 		p.extOff = []int32{0}
 	}
 	for _, nbr := range neighbors {
-		if nbr < 0 || nbr > int64(^uint32(0)>>1) {
+		if nbr < 0 || nbr > maxInt32Offset {
 			return fmt.Errorf("horosvec: neighbor %d out of int32 range", nbr)
 		}
 		p.nbrs = append(p.nbrs, int32(nbr))
+	}
+	// B3 : garde le CUMUL N×degré (offset dans nbrs), pas seulement chaque id de voisin.
+	if err := checkInt32Offset(int64(len(p.nbrs)), "neighbors"); err != nil {
+		return err
 	}
 	p.nbrOff = append(p.nbrOff, int32(len(p.nbrs)))
 
 	p.extOff[len(p.extOff)-1] = int32(len(p.extIDs))
 	p.extIDs = append(p.extIDs, extID...)
+	// B3 : garde le CUMUL des octets d'ext_ids (offset final dans extIDs) avant la troncature.
+	if err := checkInt32Offset(int64(len(p.extIDs)), "ext_ids"); err != nil {
+		return err
+	}
 	p.extOff = append(p.extOff, int32(len(p.extIDs)))
 
 	p.n++
@@ -226,7 +250,12 @@ func (idx *Index) extendPlaneAfterInsert(insertedOrder []int64, pendingNodes map
 	for _, nodeID := range insertedOrder {
 		node := pendingNodes[nodeID]
 		if err := idx.plane.appendNode(node.code, node.sqNorm, node.l1Norm, node.extID, node.neighbors); err != nil {
-			// Incohérence structurelle : rebuilder depuis SQLite au prochain build.
+			// A5 : incohérence structurelle du plan chaud. Le plan est invalidé (reconstruit
+			// depuis SQLite au prochain build) et le repli SQL/cache reste correct : dégradation
+			// d'observabilité, jamais avalée. Compteur exposé (PlaneDegraded) + journal d'erreur.
+			idx.planeDegraded.Add(1)
+			slog.Error("horosvec: hot plane extension failed after insert, plane invalidated",
+				"node", nodeID, "err", err)
 			idx.plane = nil
 			idx.planePatch = nil
 			return

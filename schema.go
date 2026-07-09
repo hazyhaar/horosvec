@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"time"
 )
 
@@ -185,6 +186,18 @@ func loadIndex(db *sql.DB) (medoid int64, dim int, nodeCount int, centroid []flo
 	}
 	nodeCount = int(deserializeInt64(countBytes))
 
+	// O3 : la méta node_count n'est plus crue sur parole. On la réconcilie avec le COUNT(*)
+	// réel de vindex_nodes — source de vérité. Un écart (méta obsolète après un crash ou un
+	// import) est journalisé et c'est le COUNT(*) qui prime pour toutes les décisions de
+	// chargement (seuil brute-force, flat, arène). La réconciliation est best-effort : si la
+	// requête échoue (table illisible), on garde la méta et la garde A2 (getMaxNodeID) fera
+	// échouer New fail-loud juste après.
+	if actual, cErr := getNodeCount(db); cErr == nil && actual != nodeCount {
+		slog.Warn("horosvec: node_count meta reconciled with COUNT(*)",
+			"meta", nodeCount, "actual", actual)
+		nodeCount = actual
+	}
+
 	centroidBytes, err := loadMeta(db, "centroid")
 	if err != nil {
 		return 0, 0, 0, nil, 0, fmt.Errorf("load centroid: %w", err)
@@ -249,15 +262,6 @@ func getNodeCount(db *sql.DB) (int, error) {
 	var count int
 	err := db.QueryRow("SELECT COUNT(*) FROM vindex_nodes").Scan(&count)
 	return count, err
-}
-
-// updateNodeCountInt64 updates the node_count in vindex_meta using int64 serialization.
-func updateNodeCountInt64(db *sql.DB, count int64) error {
-	_, err := db.Exec(
-		"INSERT OR REPLACE INTO vindex_meta (key, value) VALUES (?, ?)",
-		"node_count", serializeInt64(count),
-	)
-	return err
 }
 
 // warmCache pre-loads the medoid and its neighbors up to depth hops.
