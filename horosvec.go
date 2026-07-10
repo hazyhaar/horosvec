@@ -341,11 +341,17 @@ func New(db *sql.DB, cfg Config) (*Index, error) {
 
 		warmCache(context.Background(), db, idx.cache, idx.medoid, 2)
 
-		// Load flat vectors for brute-force search. En mode arène (ArenaPath posé), le
-		// SQLite est vector-less (blobs vides) : loadFlatVectors produirait un flatVecs vide
-		// et ferait paniquer bruteForceFlat. La source des vecteurs est alors l'arène, lue
-		// par bruteForceArena — on NE charge donc PAS le flat.
-		if nodeCount <= cfg.BruteForceThreshold && cfg.ArenaPath == "" {
+		// Load flat vectors. En mode arène (ArenaPath posé), le SQLite est vector-less
+		// (blobs vides) : loadFlatVectors produirait un flatVecs vide et ferait paniquer
+		// bruteForceFlat. La source des vecteurs est alors l'arène, lue par bruteForceArena
+		// — on NE charge donc PAS le flat.
+		//
+		// En mode db-blob (ArenaPath == ""), le miroir plat est chargé À TOUTE ÉCHELLE, et
+		// non plus seulement sous BruteForceThreshold : il sert désormais aussi de source du
+		// re-classement vamana (branche flatVecs de Search), lu sans verrou ni cache LRU ni
+		// SQL. Le coût mémoire (tous les vecteurs fp32 résidents) est le contrat assumé du
+		// mode db-blob rapide.
+		if cfg.ArenaPath == "" {
 			idx.loadFlatVectors()
 		}
 
@@ -835,6 +841,18 @@ func (idx *Index) vamanaSearch(ctx context.Context, query []float32, topK int) (
 		if idx.arena != nil && idx.arena.vecInto(candidates[i].nodeID, arenaVec) {
 			candidates[i].dist = l2DistanceSquared(query, arenaVec)
 			continue
+		}
+		// Chemin db-blob rapide : le miroir plat fp32 (flatVecs), indexé dense par node_id
+		// et entretenu par l'Insert, est lu directement par offset — aucun verrou (mu/cache
+		// LRU), aucun SQL. Ordre de priorité : arène → flatVecs → loadNodeReadOnly. Le repli
+		// SQL n'est emprunté que si flatVecs est absent (mode arène ou flat désactivé pour
+		// blob désaligné) ou si l'offset sort des bornes (fail-soft, jamais de panic).
+		if idx.flatVecs != nil {
+			off := int(candidates[i].nodeID) * idx.dim
+			if off >= 0 && off+idx.dim <= len(idx.flatVecs) {
+				candidates[i].dist = l2DistanceSquared(query, idx.flatVecs[off:off+idx.dim])
+				continue
+			}
 		}
 		node, err := loadNodeReadOnly(ctx, idx.db, idx.cache, candidates[i].nodeID)
 		idx.rerankSQLLoads.Add(1)

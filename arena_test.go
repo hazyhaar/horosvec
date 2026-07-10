@@ -284,9 +284,15 @@ func TestArenaSearchParityAndNoArenaUnchanged(t *testing.T) {
 			}
 		}
 	}
-	// Sans arène : le rerank a bien emprunté la voie SQL (comportement inchangé).
-	if idxPlain.RerankSQLLoads() == 0 {
-		t.Fatal("sans arène, le rerank devrait emprunter la voie SQL (compteur > 0)")
+	// Sans arène (db-blob) : le miroir plat fp32 (flatVecs) est désormais chargé à toute
+	// échelle et sert le re-classement SANS verrou ni SQL. L'oracle est donc l'INVERSE de
+	// l'ancien : aucune charge de rerank SQL ne doit avoir eu lieu (le chemin flatVecs court-
+	// circuite loadNodeReadOnly). Le repli SQL n'est emprunté que si flatVecs est absent.
+	if idxPlain.flatVecs == nil {
+		t.Fatal("sans arène, flatVecs devrait être chargé (mode db-blob RAM-résident)")
+	}
+	if idxPlain.RerankSQLLoads() != 0 {
+		t.Fatalf("sans arène, le rerank via flatVecs ne doit pas toucher SQL, compteur=%d", idxPlain.RerankSQLLoads())
 	}
 	idxPlain.Close()
 
