@@ -46,6 +46,15 @@ type Config struct {
 	// RotationSeed: PCG seed for diagonal signs. 0 means defaultRotationSeed (42).
 	RotationSeed uint64
 
+	// FlatVecsMaxBytes borne l'empreinte mémoire du miroir plat fp32 (flatVecs) chargé
+	// en mode db-blob (ArenaPath == "") à toute échelle. Avant de charger le miroir au
+	// New(), l'empreinte estimée (nodeCount * dim * 4 octets) est comparée à ce budget :
+	// si elle le dépasse, flatVecs N'EST PAS chargé et Search se replie proprement sur
+	// loadNodeReadOnly (SQL + cache LRU) — dégradation gracieuse, jamais d'OOM. 0 (défaut)
+	// signifie budget illimité : comportement strictement inchangé (miroir chargé comme
+	// avant, opt-out du garde). Le mode arène (ArenaPath posé) n'est jamais concerné.
+	FlatVecsMaxBytes int64
+
 	// ArenaPath, when non-empty, points to a flat fp16 arena file (produced by
 	// ExportArena). When present and valid at New(), the exact-rerank stage of
 	// Search reads raw vectors from the arena (fp16→fp32 on the fly) instead of
@@ -261,6 +270,10 @@ type Index struct {
 	// chemin de désérialisation non fiable (repli rerank SQL, brute-force SQLite, A4) : la ligne
 	// est sautée au lieu de faire paniquer l2DistanceSquared (slicing hors borne). Fail-soft.
 	malformedVectorSkips atomic.Int64
+	// flatVecsBudgetSkips compte les chargements du miroir plat fp32 refusés au New() faute
+	// de budget (Config.FlatVecsMaxBytes dépassé par l'empreinte estimée). > 0 signale que
+	// Search opère en repli SQL/cache (dégradation gracieuse assumée), jamais un OOM.
+	flatVecsBudgetSkips atomic.Int64
 }
 
 // RerankSQLLoads retourne le nombre cumulé de chargements SQL déclenchés par l'étape
@@ -286,6 +299,13 @@ func (idx *Index) PlaneDegraded() int64 {
 // de longueur sur un chemin non fiable (A4). > 0 signale des blobs corrompus/désalignés en base.
 func (idx *Index) MalformedVectorSkips() int64 {
 	return idx.malformedVectorSkips.Load()
+}
+
+// FlatVecsBudgetSkips retourne le nombre cumulé de chargements du miroir plat fp32 refusés
+// faute de budget (Config.FlatVecsMaxBytes dépassé par l'empreinte estimée nodeCount*dim*4).
+// > 0 signale que Search opère en repli SQL/cache — dégradation gracieuse, jamais un OOM.
+func (idx *Index) FlatVecsBudgetSkips() int64 {
+	return idx.flatVecsBudgetSkips.Load()
 }
 
 // New creates or loads an Index from the given database.
@@ -351,8 +371,23 @@ func New(db *sql.DB, cfg Config) (*Index, error) {
 		// re-classement vamana (branche flatVecs de Search), lu sans verrou ni cache LRU ni
 		// SQL. Le coût mémoire (tous les vecteurs fp32 résidents) est le contrat assumé du
 		// mode db-blob rapide.
+		//
+		// Garde de capacité RAM : la condition de chargement est une proxy d'ÉCHELLE, pas de
+		// RAM libre. Avant de charger le miroir à grande échelle, l'empreinte fp32 estimée
+		// (nodeCount * dim * 4 octets) est comparée à Config.FlatVecsMaxBytes. Si le budget
+		// (non nul) est dépassé, le miroir n'est PAS chargé : Search se replie sur le chemin
+		// loadNodeReadOnly (SQL + cache LRU), dégradation gracieuse, jamais d'OOM. Budget nul =
+		// illimité (comportement historique préservé, opt-in du garde).
 		if cfg.ArenaPath == "" {
-			idx.loadFlatVectors()
+			estBytes := int64(nodeCount) * int64(dim) * 4
+			if cfg.FlatVecsMaxBytes > 0 && estBytes > cfg.FlatVecsMaxBytes {
+				idx.flatVecsBudgetSkips.Add(1)
+				slog.Info("horosvec: flat vectors skipped: estimated footprint exceeds budget, falling back to SQL rerank",
+					"est_bytes", estBytes, "budget_bytes", cfg.FlatVecsMaxBytes,
+					"node_count", nodeCount, "dim", dim)
+			} else {
+				idx.loadFlatVectors()
+			}
 		}
 
 		if err := idx.rebuildPlaneLocked(); err != nil {
@@ -376,6 +411,21 @@ func New(db *sql.DB, cfg Config) (*Index, error) {
 	}
 
 	return idx, nil
+}
+
+// flatVecsExceedsBudget rapporte si peupler/étendre flatVecs jusqu'à holdNodeCount nœuds
+// dépasserait Config.FlatVecsMaxBytes (0 = illimité). Estime l'empreinte fp32 comme
+// holdNodeCount * dim * 4 octets, même formule que la garde de chargement au New(). Centralise
+// la garde pour que Build() et Insert() appliquent EXACTEMENT la même règle que New() sur
+// tous les chemins qui font croître flatVecs (trou A du fix 2026-07-08 : la garde ne couvrait
+// que le rechargement, laissant Build et l'accumulation runtime d'Insert peupler flatVecs
+// sans borne).
+func (idx *Index) flatVecsExceedsBudget(holdNodeCount int) bool {
+	if idx.cfg.FlatVecsMaxBytes <= 0 {
+		return false
+	}
+	estBytes := int64(holdNodeCount) * int64(idx.dim) * 4
+	return estBytes > idx.cfg.FlatVecsMaxBytes
 }
 
 // loadFlatVectors loads all vectors into contiguous memory for brute-force search.
@@ -542,12 +592,24 @@ func (idx *Index) Build(ctx context.Context, iter VectorIterator) error {
 		})
 	}
 
-	// Build flat vector array for brute-force search
-	idx.flatVecs = make([]float32, len(allVecs)*dim)
-	idx.flatIDs = make([][]byte, len(allVecs))
-	for i, v := range allVecs {
-		copy(idx.flatVecs[i*dim:], v)
-		idx.flatIDs[i] = allIDs[i]
+	// Build flat vector array for brute-force search — même garde budget qu'au New()
+	// (trou A) : un Build ou un rebuild async à grande échelle qui peuplerait flatVecs sans
+	// borne contournerait la garde de chargement et OOMerait dès la construction. Si
+	// l'empreinte estimée dépasse Config.FlatVecsMaxBytes, flatVecs reste nil : Search se
+	// replie sur loadNodeReadOnly (SQL + cache LRU) — même dégradation gracieuse qu'au
+	// rechargement.
+	if idx.flatVecsExceedsBudget(len(allVecs)) {
+		idx.flatVecsBudgetSkips.Add(1)
+		slog.Info("horosvec: flat vectors skipped at build: estimated footprint exceeds budget, falling back to SQL rerank",
+			"est_bytes", int64(len(allVecs))*int64(dim)*4, "budget_bytes", idx.cfg.FlatVecsMaxBytes,
+			"node_count", len(allVecs), "dim", dim)
+	} else {
+		idx.flatVecs = make([]float32, len(allVecs)*dim)
+		idx.flatIDs = make([][]byte, len(allVecs))
+		for i, v := range allVecs {
+			copy(idx.flatVecs[i*dim:], v)
+			idx.flatIDs[i] = allIDs[i]
+		}
 	}
 
 	if err := idx.rebuildPlaneLocked(); err != nil {
@@ -665,7 +727,12 @@ func (idx *Index) Search(ctx context.Context, query []float32, topK int) ([]Resu
 // Uses flat in-memory vectors when available (zero-alloc hot path),
 // falls back to SQL scan otherwise.
 func (idx *Index) bruteForceSearch(ctx context.Context, query []float32, topK int) ([]Result, error) {
-	if idx.flatVecs != nil {
+	// bruteForceFlat scanne indistinctement tout idx.flatIDs (pas de garde par offset comme
+	// le chemin rerank) : il exige donc une couverture COMPLÈTE (un flatVecs partiel — gelé
+	// en cours de croissance par la garde budget de l'Insert — ferait manquer silencieusement
+	// les node_id au-delà du gel, un déficit de rappel plutôt qu'un crash, mais un déficit tout
+	// de même). Dégradation vers le scan SQLite exact tant que la couverture n'est pas totale.
+	if idx.flatVecs != nil && int64(len(idx.flatIDs)) == idx.nextID {
 		return idx.bruteForceFlat(ctx, query, topK)
 	}
 	// Mode arène (SQLite vector-less) : les blobs vecteur sont vides ; la source des
@@ -1307,9 +1374,28 @@ func (idx *Index) Insert(ctx context.Context, vecs [][]float32, ids [][]byte) er
 			cached.neighbors = neighbors
 		}
 	}
+	// Sémantique runtime (trou A) : le budget est un contrat de TAILLE MAXIMALE, pas
+	// seulement une décision au chargement. Un flatVecs déjà peuplé (sous le budget à l'ouverture)
+	// grandirait sans borne à chaque Insert si l'append restait inconditionnel — c'était le
+	// second angle mort du fix précédent (garde absente au runtime). Avant d'étendre, on projette
+	// la taille finale ; si elle dépasserait le budget, la croissance est GELÉE : flatVecs reste
+	// à sa taille courante (mirroir PARTIEL, node_id 0..k-1 seulement). C'est sûr par construction
+	// avec le seul autre lecteur du miroir en mode grande échelle (branche rerank de Search,
+	// ligne ~885) : elle borne déjà `off+dim <= len(flatVecs)` avant de lire, donc tout node_id
+	// au-delà du gel retombe automatiquement sur loadNodeReadOnly (SQL + cache LRU) — aucune
+	// désynchro node_id→offset, aucune troncature silencieuse. bruteForceSearch (mode petit
+	// corpus, ligne ~703) est également gardé : il n'emprunte le flat que si la couverture est
+	// COMPLÈTE (cf. flatIDs complet == nextID), sinon bascule sur SQLite pour garantir 100% de
+	// rappel exact même avec un flatVecs partiel.
 	if idx.flatVecs != nil {
-		idx.flatVecs = append(idx.flatVecs, pendingFlatVecs...)
-		idx.flatIDs = append(idx.flatIDs, pendingFlatIDs...)
+		if projected := len(idx.flatVecs)/idx.dim + len(pendingFlatIDs); idx.flatVecsExceedsBudget(projected) {
+			idx.flatVecsBudgetSkips.Add(1)
+			slog.Info("horosvec: flat vectors growth frozen: projected footprint exceeds budget, new nodes fall back to SQL rerank",
+				"projected_node_count", projected, "budget_bytes", idx.cfg.FlatVecsMaxBytes, "dim", idx.dim)
+		} else {
+			idx.flatVecs = append(idx.flatVecs, pendingFlatVecs...)
+			idx.flatIDs = append(idx.flatIDs, pendingFlatIDs...)
+		}
 	}
 	idx.nextID = next
 	for _, vec := range pendingCentroidVecs {
@@ -1521,12 +1607,24 @@ func (idx *Index) rebuildInternal(ctx context.Context, iter VectorIterator) {
 	idx.centroid.AddBatch(allVecs)
 	idx.centroid.SnapshotBuild()
 
-	// Build flat vector array for brute-force search
-	idx.flatVecs = make([]float32, len(allVecs)*dim)
-	idx.flatIDs = make([][]byte, len(allVecs))
-	for i, v := range allVecs {
-		copy(idx.flatVecs[i*dim:], v)
-		idx.flatIDs[i] = allIDs[i]
+	// Build flat vector array for brute-force search — même garde budget qu'au New()
+	// (trou A) : un Build ou un rebuild async à grande échelle qui peuplerait flatVecs sans
+	// borne contournerait la garde de chargement et OOMerait dès la construction. Si
+	// l'empreinte estimée dépasse Config.FlatVecsMaxBytes, flatVecs reste nil : Search se
+	// replie sur loadNodeReadOnly (SQL + cache LRU) — même dégradation gracieuse qu'au
+	// rechargement.
+	if idx.flatVecsExceedsBudget(len(allVecs)) {
+		idx.flatVecsBudgetSkips.Add(1)
+		slog.Info("horosvec: flat vectors skipped at build: estimated footprint exceeds budget, falling back to SQL rerank",
+			"est_bytes", int64(len(allVecs))*int64(dim)*4, "budget_bytes", idx.cfg.FlatVecsMaxBytes,
+			"node_count", len(allVecs), "dim", dim)
+	} else {
+		idx.flatVecs = make([]float32, len(allVecs)*dim)
+		idx.flatIDs = make([][]byte, len(allVecs))
+		for i, v := range allVecs {
+			copy(idx.flatVecs[i*dim:], v)
+			idx.flatIDs[i] = allIDs[i]
+		}
 	}
 
 	idx.cache.clear()
