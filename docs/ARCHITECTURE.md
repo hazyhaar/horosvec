@@ -45,7 +45,38 @@ isometry; the seed and round count are persisted in `vindex_meta` and reloaded,
 so codes encoded under one seed can never be estimated under another. The
 rotation lifted the SIFT recall ceiling from 0.955 to 0.987.
 
-## 4. Storage topologies
+## 4. Storage topologies — two artifacts, not two modes
+
+Product frontier (decided 2026-07-11, anchored to the 2026-07-10 measurements
+archived in `audits/`, commit b1ac836):
+
+- **DB-blob(-flat) is the WORKING artifact** — the incremental, transactional
+  mode for live indexes. Its justification is incrementality and simplicity,
+  not speed: after the flatVecs fix it runs at throughput PARITY with the
+  arena (40,619 vs 39,599 QPS at concurrency 32, a ~2.5% gap within
+  measurement noise — do not quote either mode as "the fastest").
+  The qualifier "incremental" is CONDITIONAL until the Vamana-under-inserts
+  validation bench (portfolio task P0) renders its verdict: the transactional
+  graft exists, but recall/throughput degradation under sustained inserts is
+  not yet profiled.
+- **The arena is the PUBLICATION artifact** — a frozen, per-SHARD serving
+  format (analogy: a table vs. a Parquet file). Per shard only: the 26.7M
+  monolith build is dead by construction on CPU (~3 days AND >62 GiB RAM,
+  measured 2026-07-10); publication targets daily/monthly shards.
+
+Consumers impact note: the known importers — `horos55/internal/silo_retrieval/
+retriever.go`, `horos55/internal/codemap/embedder/horosvec_writer.go`,
+`horos55/cmd/horos55-codemap/similar_cmd.go` — use the DB-blob working mode
+through the public API; this frontier is documentation of intent and changes
+no engine code and no API contract.
+
+The periodic arena↔blob bridge is kept as a DOCUMENTED CONDITIONAL FALLBACK
+(veille), not an active backlog item: it only becomes relevant if db-blob-flat
+fails at a scale a consumer actually needs. The growing segmented arena
+design (proven at prototype level: 435M verified reads under append churn,
+zero torn reads — see `horosvec-bench/audits/2026-07-10_design_arene_
+croissante.md`) is archived as NOT INTEGRATED for lack of a consumer; it is
+the documented reopening path if the fallback is ever needed.
 
 | Mode | Vectors live in | Insert | Scale ceiling |
 |---|---|---|---|
@@ -171,8 +202,10 @@ configurations where hnswlib wins.
 
 ## 10. Known limits / backlog (engraved, not hidden)
 
-- No online writes at scale: arena mode is build-once/serve-many (appendable
-  arena + shadow rebuild are designed, not built).
+- No online writes at scale: arena mode is build-once/serve-many BY DESIGN
+  (see §4 — publication artifact). The appendable segmented arena is designed
+  and prototype-proven but deliberately not integrated (no consumer); it is
+  the reopening path, not a debt.
 - The tri-modal storage branching wants a `NodeStore` abstraction before a
   fourth mode is added.
 - Filtered search (predicate/allow-list during the walk) is the top functional

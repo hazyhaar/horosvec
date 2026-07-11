@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"syscall"
 )
 
 // Arène plate fp16 : stockage contigu, pointer-free, en lecture seule, des vecteurs
@@ -57,7 +56,7 @@ func (a *arena) close() error {
 	data := a.data
 	a.data = nil
 	a.mmapped = false
-	if err := syscall.Munmap(data); err != nil {
+	if err := munmapRO(data); err != nil {
 		return fmt.Errorf("horosvec: munmap arena: %w", err)
 	}
 	return nil
@@ -362,16 +361,16 @@ func openArena(path string) (*arena, error) {
 	if size < arenaHeaderSize {
 		return nil, fmt.Errorf("horosvec: open arena: file too short (%d < %d)", size, arenaHeaderSize)
 	}
-	// mmap MAP_SHARED lecture seule : les pages fp16 restent dans le page cache noyau,
-	// jamais copiées dans le tas Go (tenable à 27 Go). L'fd peut être refermé après mmap :
-	// la cartographie survit à la fermeture du descripteur.
-	data, err := syscall.Mmap(int(f.Fd()), 0, int(size), syscall.PROT_READ, syscall.MAP_SHARED)
+	// mmap lecture seule (mmap_unix.go) : les pages fp16 restent dans le page cache
+	// noyau, jamais copiées dans le tas Go (tenable à 27 Go). L'fd peut être refermé
+	// après mmap : la cartographie survit à la fermeture du descripteur.
+	data, err := mmapRO(f.Fd(), int(size))
 	if err != nil {
 		return nil, fmt.Errorf("horosvec: open arena: mmap: %w", err)
 	}
 	a, err := parseArenaHeader(data)
 	if err != nil {
-		_ = syscall.Munmap(data)
+		_ = munmapRO(data)
 		return nil, err
 	}
 	return a, nil
