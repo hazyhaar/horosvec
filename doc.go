@@ -35,14 +35,17 @@
 // cancellation during graph traversal returns a wrapped context error, never
 // a silent empty result.
 //
-// # Accuracy: deviation from the RaBitQ paper
+// # Accuracy: rotation and the RaBitQ paper
 //
-// This implementation deliberately omits the random rotation step of the
-// RaBitQ paper. The paper's theoretical error bounds therefore do not
-// transfer as-is: sign-bit quantization without rotation is sensitive to
-// strongly axis-aligned (anisotropic) data in principle. In practice the
-// two-stage design (wide beam preselection + exact L2 rerank) absorbs the
-// estimator noise. Measured recall@10 against exact brute force, N=2000
+// This implementation applies the randomized rotation step of the RaBitQ
+// paper as rounds of a randomized fast Walsh-Hadamard transform (H·D per
+// round, rotation.go). The rotation seed is persisted in the index metadata
+// (vindex_meta key "rotation_seed", schema.go) so codes remain reproducible
+// across reloads; rounds=0 is an explicit identity for callers that opt out.
+// The rotation straightens strongly axis-aligned (anisotropic) distributions
+// before sign-bit quantization; on top of it, the two-stage design (wide beam
+// preselection + exact L2 rerank) absorbs the residual estimator noise.
+// Measured recall@10 against exact brute force, N=2000
 // base vectors, 50 queries, defaults:
 //
 //   - uniform synthetic, dim 128:            mean 1.000
@@ -68,6 +71,12 @@
 //     graph path and budget memory accordingly.
 //   - PRAGMA tuning applies per pooled connection; see pragma.go if you
 //     manage the *sql.DB pool yourself.
+//   - Arena mode (Config.ArenaPath) memory-maps its vector file and is
+//     supported on Unix platforms only. On other platforms (e.g. Windows)
+//     the package compiles — mmap is isolated behind build tags (mmap_unix.go
+//     / mmap_stub.go) — but opening or importing an arena fails loudly at
+//     runtime. This is a compile-only, best-effort posture: no runtime
+//     Windows support is claimed or tested. DB-blob mode is unaffected.
 //   - The pointer-free hot plane (hotPlane) indexes neighbor and ext_id
 //     offsets with int32. The cumulative number of neighbors (N times degree)
 //     and the cumulative ext_id byte length must each stay below 2^31; the

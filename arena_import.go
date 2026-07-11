@@ -8,7 +8,6 @@ import (
 	"math"
 	"math/rand/v2"
 	"os"
-	"syscall"
 )
 
 // Voie d'IMPORT d'adjacence externe (build GPU CAGRA) vers un index horosvec complet.
@@ -77,7 +76,7 @@ func openAdjacency(path string, count int64, degree int) (*adjReader, error) {
 	if want == 0 {
 		return nil, fmt.Errorf("horosvec: open adjacency: empty adjacency (count=%d degree=%d)", count, degree)
 	}
-	data, err := syscall.Mmap(int(f.Fd()), 0, int(want), syscall.PROT_READ, syscall.MAP_SHARED)
+	data, err := mmapRO(f.Fd(), int(want))
 	if err != nil {
 		return nil, fmt.Errorf("horosvec: open adjacency: mmap: %w", err)
 	}
@@ -91,7 +90,7 @@ func (r *adjReader) close() error {
 	}
 	data := r.data
 	r.data = nil
-	if err := syscall.Munmap(data); err != nil {
+	if err := munmapRO(data); err != nil {
 		return fmt.Errorf("horosvec: munmap adjacency: %w", err)
 	}
 	return nil
