@@ -55,10 +55,14 @@ archived in `audits/`, commit b1ac836):
   not speed: after the flatVecs fix it runs at throughput PARITY with the
   arena (40,619 vs 39,599 QPS at concurrency 32, a ~2.5% gap within
   measurement noise — do not quote either mode as "the fastest").
-  The qualifier "incremental" is CONDITIONAL until the Vamana-under-inserts
-  validation bench (portfolio task P0) renders its verdict: the transactional
-  graft exists, but recall/throughput degradation under sustained inserts is
-  not yet profiled.
+  The qualifier "incremental" is VALIDATED (P0 verdict, 2026-07-12, archived
+  in `horosvec-bench/audits/2026-07-12_p0_vamana_validation.md`): under
+  inserts up to +50% of the initial build, max recall@10 drop vs a full
+  rebuild is 0.0050 (alert threshold 0.01) at equivalent search throughput;
+  month-shard RAM is bounded (175k build: 1.38 GiB heap; +87.5k inserts:
+  4.5 GiB Sys). Known cost: insert throughput (~42 ms/vector) is ~5× the
+  build cost per vector — daily deltas are fine (~8 min for 11.6k), monthly
+  refits should prefer a rebuild.
 - **The arena is the PUBLICATION artifact** — a frozen, per-SHARD serving
   format (analogy: a table vs. a Parquet file). Per shard only: the 26.7M
   monolith build is dead by construction on CPU (~3 days AND >62 GiB RAM,
