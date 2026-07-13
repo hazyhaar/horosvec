@@ -762,6 +762,208 @@ What this afternoon adds to the collection:
   gcDrain + 21% withLock reads as "allocation storm behind a shared mutex" —
   the profile named both the disease and the door it came through.
 
+## 8quinquies. July 12 — the qualification campaign: five daughters, two documented failures
+
+A coordinated campaign (five bounded tasks forged with pre-frozen falsifiable
+criteria, each adversarially refuted by three independent model families before
+being engraved) closed the questions the benchmark days had opened. Its two
+*failures* are the valuable part, because both were closed with their thresholds
+intact rather than renegotiated.
+
+**P0 — the incremental claim, qualified.** Two doubts hung over the db-blob
+incremental path: does building the graph with quantized distances (instead of
+fp32) degrade it, and does grafting inserts into a built graph erode recall?
+Measured on real HN vectors: quantized-build recall matches fp32-build within
+noise (1.0000 vs 0.9995), and +50% dynamic inserts cost at most 0.0050 recall
+against a full rebuild, at equal query throughput. Insert throughput is ~5×
+slower than build (42 ms/vec vs 8.6) — a daily HN delta grafts in ~8 minutes,
+a monthly catch-up prefers the rebuild. The conditional that ARCHITECTURE.md §4
+had carried was lifted by a dated measurement, not by argument.
+
+**P1 — the BM25 pre-pass, killed by its own harness.** The hypothesis: a cheap
+lexical front-end (FTS5/BM25 top-200 per shard) shrinks the candidate set before
+exact dense scoring. At shard scale (~10k items) the answer is unambiguous:
+hybrid recall@10 0.5445 vs 1.0000 for plain dense search, at *worse* latency
+(p95 62.9 ms vs 15.8 ms) — dense neighbors of a story often share no title
+token, and the rerank the pre-pass was supposed to save costs 0.8 ms anyway.
+The first run of this harness returned recall 0.0300 — exactly the scope-
+reduction ratio, i.e. exactly chance — because arena rank had been read as
+`id-1`. The embedding pipeline had skipped dead items; the `.ids` sidecar is
+the only truth. The initial "verification" had checked the first ten ranks,
+the only region where the two mappings coincide: a universal claim generalized
+from a non-exhaustive enumeration, caught because *recall equal to scope
+reduction is the signature of misalignment*.
+
+**P2 — the SIMD wall.** An AVX2 kernel for the graph walk won ×1.26 in
+isolation and +0.4-5.3% end-to-end under concurrency 32 — the ceiling is
+memory bandwidth, not arithmetic. Abandoned with the threshold (15%) intact.
+Corollary engraved for future perf work: a gain threshold must name its
+concurrency *and* its scale, or it is not falsifiable.
+
+## 8sexies. July 13 — the demo that contradicted the README, and the server measured in the face
+
+With the incremental claim now public, the demo at horosvec.hazyhaar.fr was
+still serving a snapshot frozen at July 8 — and returning bare ids
+(`{"id":"6069168","score":0.30}`) with the titles sitting unused in a database.
+A live claim served by a stale demo is a walking refutation of itself. A
+six-task project (coordination mother + five bounded daughters) was forged to
+make the demo *prove* the claim: a server-side title store, human-readable
+results, a daily delta chain over the qualified insert path, monthly arena
+publication, federated search across the frozen monolith and the live shard.
+
+The first daughter — measure the three server unknowns before anything sizes
+itself on assumptions — closed the same afternoon, and promptly falsified the
+sizing folklore. The "2-3× slower than the 32-core dev box" band that had been
+carried since July 10: the measured ratio on the production Xeon (12 threads)
+is **×4.76** (three runs, 307.8/309.7/312.1 s on the *same* 11,600-vector real
+input as the local 65 s baseline). Peak RSS ~57 MB, identical to local — a
+non-issue on 64 GB. And the number nobody had: a concurrent build costs the
+live demo **+28% on p95** (99.7 → 127.3 ms over 181 samples, identical query
+profile), with latency dominated by the embedding sidecar in both regimes —
+measured in the face, not inferred by elimination. Five minutes per daily
+shard remains operationally trivial; the extrapolated band was still wrong,
+and now a real contention threshold exists for the automation to be judged
+against.
+
+One harness lesson from the forging itself: the task store enforces its
+criteria limit in **UTF-8 bytes** while every composer upstream counted
+characters — four out of six engravings bounced until the accented text was
+measured in the unit the gate actually checks. The gate and the writer must
+name the same unit.
+
+The first daughter to ship end to end was G2, the server-side title store — the
+fix for a demo that returned bare ids while the titles sat unused. The design
+decision (probed before dispatch): the module carries no parquet reader and
+adding one would breach its dependency discipline, so the 28M historical bulk
+is a one-shot `duckdb` conversion (parquet → SQLite, the tool that made the
+original text db), while the deployed Go binary reads only the HN delta —
+pure-Go, CGO-off, zero new dependency. A composer coded it "à poil" (every
+frame inlined, incremental report to scratch); the gates and the parquet
+mechanism were re-run at the ground rather than relayed — id 1 really is "Y
+Combinator". The full 28M conversion took 33 seconds and produced a 905 MB
+store (28,737,557 rows, zero duplicates), rsynced to the server and verified
+queryable there. Two honesties surfaced in passing: `duckdb` refuses
+`INSERT OR REPLACE` on an attached SQLite (so idempotence lives in the Go
+delta path, not the bulk), and ~0.4% of items carry `ts=0` — a real title with
+no timestamp, a data-quality note the date rendering must handle. The store is
+now *placed* but not *visible*: the served binary has no join yet — that is the
+next daughter. A published claim is only proven when the demo shows it.
+
+Driving the demo surfaced the sharper design question. A search for "jailbreak"
+returned, correctly, comments whose text is literally "jailbreak" (d²≈0.0001) —
+semantically perfect, but titleless one-word cards that read as garbage. The
+ranking was *not* inverted (verified in the served JS and the API); the corpus
+is the issue: 24.4M of the 28.7M items are comments. The resolution is not to
+drop comments (they are valid evidence — "who knows what's buried there") but to
+rank and display by **thread**: the root story on top, matching comments
+clickable inside a folded tree. Two sub-questions fell out. Ranking a thread:
+sum *saturating similarities* (not distances) of its retrieved hits with a
+max-dominated aggregate (log-sum-exp), and crucially **do not divide by thread
+size** — that inverts toward trivia exactly like the one-word comment, a 500-
+comment thread with 10 strong hits scoring below a 2-comment thread with one.
+Building the tree: the `parent` backlink is the primitive, and because a HN
+child's id always exceeds its parent's (verified: 99.996% of 28.7M, roots carry
+parent=0), the root story of every item resolves in a single ascending-id pass —
+the parent is always already resolved when the child is reached.
+
+That foundation was engraved, adversarially refuted by an independent model, and
+implemented. The refutation earned its keep: it rejected the "self-root the
+unresolved comment" fallback as a silent-false root, forcing an explicit orphan
+mark and a mandatory second pass for the 1234 id-anomalies; it demanded a
+deferred queue for out-of-order arrival and scale tests over 1000+ threads
+instead of toy samples. The delivered extension was verified independently at the
+ground — a re-coded parent-walk agreed with the computed root_id on 2000 random
+items with zero mismatch, orphans were the parent-absent case marked explicitly
+(never self-rooted), and an out-of-order append (child before parent) correctly
+parked in the pending queue and resolved when the root arrived. The tree lives
+entirely in the metadata store, joined to the vector index by ext_id at query
+time — the surgical graft that P0 qualified never learns what a parent is.
+
+The display was then rebuilt on that foundation and shipped to the live demo.
+The adversarial pass again paid: it forced tau and the raw-hit count out of
+hiding (both govern ranking and recall), named the internal tension between a
+summed thread score and top-k retrieval — a diffuse thread with no hit in the
+top-k is structurally invisible, accepted and documented — and rejected loading
+the real ancestor chain as gold-plating, so the tree renders as the root story
+plus its matched comments indented by depth, with a decorative fold. Two facts
+it flagged were settled at the ground rather than assumed: every story and every
+orphan carries root_id = itself, so a story-hit or an orphan is a valid one-node
+thread. The result: "jailbreak", which a week earlier returned bare ids topped
+by a one-word comment, now returns 295 titled threads — "AppleID password brute
+force proof-of-concept" carrying the exact-match comment, "JailbreakMe 3.0",
+"Evasi0n iOS 6.x jailbreak" with its two matched comments nested — served in
+~100 ms with the freshness date drawn from the store, the client no longer
+round-tripping to the Hacker News API for a list title. The comment that
+matches is one click from its text; the thread it lives in is finally legible.
+Known edge left standing: matched comments show no inline snippet (their text
+is not in the store — only titles are), so the "what's buried here" is revealed
+on click, not in the list.
+
+That edge was then closed. The user's verdict on the empty detail pane —
+"horrible" — drove storing the comment text itself: a `text` column backfilled
+from the parquet (24.1M items carry text; the store grew from 2 GB to 13 GB),
+and a serve endpoint that reads the item's text from the store rather than the
+Hacker News API. Now the matched comment shows its text inline under the story,
+and clicking it fills the detail pane with the full comment — "Rust is
+memory-safe; C++11 is not." — all from the local store, the browser no longer
+touching HN for any content. Two things earned their keep in the doing. First,
+a ground check caught a silent corruption: the 13 GB store arrived on the server
+104 MB short and `malformed` while `rsync -z` had returned exit 0 — a compressed
+transfer that lied about success; a checksum re-sync (`rsync -c`) repaired it,
+and `PRAGMA quick_check` is the oracle, not the exit code. Second, the first
+render showed raw `<a href=…>` markup in snippets for comments containing HTML —
+XSS-safe (rendered as text) but ugly; stripping tags before entity-decoding, in
+that order (the tags are literal, the entities encoded), cleaned it. The demo now
+reads like a thread of real discussion, titles and comment text and all.
+
+The freshness chain (G4) then went live — and the ground kept teaching. The
+design is two cursors: a head that fetches each day's new items (priority), and
+a backfill that grinds the frozen Oct-2021→now gap without pressure, in short
+time-bounded runs so a crash costs one small batch and the cursor resumes. Two
+real bugs surfaced only by running it, not by the tests: a backfill budget of
+`0` was read as *unlimited* — the exact runaway the two-cursor design exists to
+prevent — now rejected outright; and the backfill's ceiling was the *moving*
+head, so on the next cycle it re-ingested everything the head had taken — fixed
+with a frozen `head_origin` boundary the two zones can never cross. A real
+bounded run then ingested genuine 2026 items ("Show HN: Ankole", dated today)
+into a separate current shard while the served monolith's mtime never moved, and
+a robustness layer landed for the operator: a `run_log` table queryable by
+`-show-runs`, resume-past-the-failed-item, retry on transient SQLite contention,
+a `-log-file`, and errors that name the phase and the item id. It runs now on a
+5-minute systemd cadence. Two honest debts stayed open, both found by measuring
+rather than assuming: end-to-end throughput is ~2.2 items/s (the per-item
+subprocess append, not the embed, is the bottleneck), so at the chosen duty the
+gap closes in months not the hoped-for one — batching the append is the fix; and
+a separate delta store means a backfilled item whose parent lives in the frozen
+monolith is an orphan there, so the federated search (G5) must resolve thread
+metadata across both stores. The chain is live; making it fast and making its
+freshness *visible* are the next two moves.
+
+Federation (G5) made it visible, and closed the campaign. The user chose to have
+the delta write directly into the served store rather than a side store — WAL
+plus a busy timeout carry the one-writer-many-readers case cleanly, and it
+erased the cross-store metadata split in one stroke: a backfilled comment's
+parent now lives in the same store, so its thread resolves with no orphan. The
+search itself became a `federatedSearcher` — one object implementing the
+existing search interface, querying the frozen monolith arena and the live delta
+shard, merging by distance and deduping by id — so the thread-grouping and
+unified-store metadata above it never changed. It reloads the shard every five
+minutes, so new items surface without a restart. A 502 taught the last lesson,
+and it was a sharp one: the freshness readout became a per-request `SELECT
+max(ts)`, and on a 13 GB store with no index on `ts` that is a full scan — fine
+in isolation, but under the delta's concurrent writer it blew the query's
+deadline and crash-looped the demo. A rollback restored service in under a
+minute; an index on `ts` took the query from 17 seconds to 3 milliseconds; the
+binary went back out. The oracle is the same one that has run through this whole
+month: measure the thing under the condition it will actually run in, not in
+isolation. The payoff is on the page now — a search for a story posted *today*
+returns it at rank one, dated 13 Jul 2026, above the frozen corpus, the header
+reading "2006 → live (federated: monolith + delta shard)". The demo that a week
+ago answered "jailbreak" with a bare id and an empty pane now reads like a live
+Hacker News: titled threads, real comment text, and a corpus that no longer ends
+in 2021. What remains are named debts, not gaps — the backfill throughput, the
+monthly shard merge, filtering deleted comments — each engraved, none blocking.
+
 ## 9. The lessons, collected
 
 1. What production does not exercise stays broken; a comparative benchmark is
@@ -826,3 +1028,27 @@ What this afternoon adds to the collection:
 26. (July 9.) High GC share plus a shared lock in a query-window profile
     reads as "allocation storm behind a mutex"; the profile names both the
     disease and the door.
+27. (July 12.) Recall equal to the scope-reduction ratio is the signature of a
+    misaligned id mapping; and a mapping "verified" on its first ten ranks —
+    the only region where two mappings coincide — is a universal claim built
+    on a non-exhaustive enumeration. The `.ids` sidecar is the only truth.
+28. (July 12.) A cheap deterministic front-end only pays where the exact stage
+    is expensive; at shard scale the dense path is already exact and cheap,
+    and the lexical pre-pass costs recall it can never buy back. Scale regime
+    is an input of the harness, not a footnote.
+29. (July 12.) A performance gain threshold must name its concurrency and its
+    scale; an isolated kernel speedup is not a result, it is a hypothesis
+    about a bottleneck that memory bandwidth may veto end-to-end.
+30. (July 12.) Close a failed task with its threshold intact. The two failures
+    of the campaign are worth more than its successes precisely because the
+    bar did not move to accommodate them.
+31. (July 13.) A published capability served by a stale demo refutes itself in
+    public; freshness is not a nicety of the showcase, it is the claim's
+    living proof.
+32. (July 13.) An extrapolated hardware band survives until someone runs the
+    same input on the target box: "2-3×" was ×4.76. Measure the contention on
+    the live service *during* the build — the delta, not folklore, is the
+    threshold automation must be judged against.
+33. (July 13.) The gate and the writer must count in the same unit: a byte
+    limit enforced against character-counting composers bounces every
+    accented payload near the bound.
