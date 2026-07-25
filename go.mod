@@ -1,6 +1,6 @@
 module github.com/hazyhaar/horosvec
 
-go 1.26
+go 1.26.5
 
 require modernc.org/sqlite v1.51.0
 
