@@ -72,7 +72,25 @@ type Config struct {
 	// deterministic due to interleaving order; graph quality is equivalent
 	// (standard DiskANN). Use BuildWorkers=1 when exact reproducibility is required.
 	BuildWorkers int
+
+	// PrefetchRerank annonce au noyau, en une fois, les plages de l'arène que la
+	// boucle de re-classement va lire, au lieu de subir un défaut de page servi
+	// séquentiellement par candidat. Sans effet hors mode arène.
+	//
+	// Activé par défaut : sur un index plus grand que la mémoire disponible, le
+	// gain mesuré va de 8,5× à 11,8× en latence selon le nombre de candidats, et
+	// 7,4× en débit à huit recherches simultanées (cf. arena_prefetch_unix.go).
+	// À désactiver seulement lorsque l'arène est durablement résidente en cache,
+	// cas où les appels système ne servent plus à rien et coûtent 4,4 %.
+	//
+	// Le conseil ne modifie aucun résultat : c'est une indication d'accès.
+	PrefetchRerank bool
 }
+
+// pageTailleOctets est la taille de page supposée pour aligner les plages
+// annoncées au noyau. 4 Kio sur les architectures visées ; une valeur inexacte
+// ne fausserait rien, elle rendrait seulement l'alignement inutile.
+const pageTailleOctets = 4096
 
 // effectiveBuildWorkers resolves Config.BuildWorkers: 1 = sequential legacy,
 // 0 = polite default (~40% of available CPU capacity, min 1).
@@ -187,6 +205,7 @@ func DefaultConfig() Config {
 		BuildPasses:          2,
 		EfSearch:             128,
 		RerankTopN:           500,
+		PrefetchRerank:       true,
 		CacheCapacity:        100_000,
 		BruteForceThreshold:  50_000,
 		Alpha:                1.2,
@@ -754,7 +773,6 @@ const bruteForceCtxCheckStride = 4096
 // force-brute. Les ext_ids sont résolus depuis le plan chaud (couverture dense garantie).
 func (idx *Index) bruteForceArena(ctx context.Context, query []float32, topK int) ([]Result, error) {
 	n := int(idx.arena.count)
-	buf := make([]float32, idx.dim)
 	best := make([]Result, 0, topK+1)
 	worstDist := math.MaxFloat64
 
@@ -764,10 +782,10 @@ func (idx *Index) bruteForceArena(ctx context.Context, query []float32, topK int
 				return nil, fmt.Errorf("horosvec: brute force arena: %w", err)
 			}
 		}
-		if !idx.arena.vecInto(int64(i), buf) {
+		d, ok := idx.arena.l2SquaredFP16(int64(i), query)
+		if !ok {
 			continue
 		}
-		d := l2DistanceSquared(query, buf)
 		if len(best) < topK || d < worstDist {
 			extID := idx.planeExtID(int64(i))
 			if extID == nil {
@@ -893,21 +911,25 @@ func (idx *Index) vamanaSearch(ctx context.Context, query []float32, topK int) (
 	if len(candidates) > rerankN {
 		candidates = candidates[:rerankN]
 	}
-	// Buffer réutilisé pour décoder un vecteur d'arène (fp16→fp32) sans allocation
-	// par candidat. Alloué une fois par Search.
-	var arenaVec []float32
-	if idx.arena != nil {
-		arenaVec = make([]float32, idx.dim)
+	// Les identifiants du lot sont tous connus ici : annoncer les plages au noyau
+	// AVANT la boucle lui laisse émettre les lectures en parallèle, au lieu d'un
+	// défaut de page synchrone par candidat. Aucun effet sur les résultats.
+	if idx.arena != nil && idx.cfg.PrefetchRerank {
+		idx.arena.prefetchRerank(candidates)
 	}
 	for i := range candidates {
 		if err := ctx.Err(); err != nil {
 			return nil, fmt.Errorf("horosvec: %w", err)
 		}
-		// Chemin recâblé : lire le vecteur brut depuis l'arène fp16 (aucun SQL,
-		// aucune pollution du cache LRU). Sans arène, chemin loadNodeReadOnly inchangé.
-		if idx.arena != nil && idx.arena.vecInto(candidates[i].nodeID, arenaVec) {
-			candidates[i].dist = l2DistanceSquared(query, arenaVec)
-			continue
+		// Chemin recâblé : mesurer la distance directement sur les octets fp16 de
+		// l'arène (aucun SQL, aucune pollution du cache LRU, aucune matérialisation
+		// d'un vecteur fp32 intermédiaire). Sans arène, chemin loadNodeReadOnly
+		// inchangé.
+		if idx.arena != nil {
+			if d, ok := idx.arena.l2SquaredFP16(candidates[i].nodeID, query); ok {
+				candidates[i].dist = d
+				continue
+			}
 		}
 		// Chemin db-blob rapide : le miroir plat fp32 (flatVecs), indexé dense par node_id
 		// et entretenu par l'Insert, est lu directement par offset — aucun verrou (mu/cache
@@ -1003,7 +1025,7 @@ func (idx *Index) rabitqGreedySearchInternal(ctx context.Context, query []float3
 		state.queryCentered[i] = c
 		querySqNorm += c * c
 	}
-	buildRabitqLUT(state.queryCentered, state.lut)
+	prepareQueryPlanes(state.queryCentered, &state.planes)
 
 	medoidCode, medoidSq, medoidL1, err := idx.greedyNodeCodeNorms(ctx, idx.medoid, loadFn)
 	if err != nil {
@@ -1014,7 +1036,7 @@ func (idx *Index) rabitqGreedySearchInternal(ctx context.Context, query []float3
 	}
 	state.visit(idx.medoid)
 
-	startDist := rabitqDistanceLUT(state.lut, querySqNorm, medoidCode, medoidSq, medoidL1)
+	startDist := rabitqDistanceBitProduct(&state.planes, querySqNorm, medoidCode, medoidSq, medoidL1)
 
 	state.pushHeap(searchCandidate{nodeID: idx.medoid, dist: startDist})
 	state.insertBest(searchCandidate{nodeID: idx.medoid, dist: startDist}, beamWidth)
@@ -1049,7 +1071,7 @@ func (idx *Index) rabitqGreedySearchInternal(ctx context.Context, query []float3
 				return true
 			}
 
-			d := rabitqDistanceLUT(state.lut, querySqNorm, nbrCode, nbrSq, nbrL1)
+			d := rabitqDistanceBitProduct(&state.planes, querySqNorm, nbrCode, nbrSq, nbrL1)
 
 			if len(state.best) < beamWidth || d < worstBest {
 				state.pushHeap(searchCandidate{nodeID: nbr, dist: d})

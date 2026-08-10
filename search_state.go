@@ -22,8 +22,10 @@ type searchState struct {
 	// Pre-allocated query centering buffer (reused across queries).
 	queryCentered []float64
 
-	// Pre-allocated RaBitQ fastscan LUT ((dim+7)/8 * 256 entries).
-	lut []float64
+	// Plans de bits de la requête quantifiée : voie BitProduct, qui remplace la
+	// table de correspondance sur le chemin chaud. Les tampons sont réutilisés
+	// d'une requête à l'autre par le pool.
+	planes queryPlanes
 }
 
 var searchPool = sync.Pool{
@@ -79,13 +81,8 @@ func (s *searchState) reset(maxNodes int64, beamWidth int, dim int) {
 		s.queryCentered = s.queryCentered[:dim]
 	}
 
-	// Reset RaBitQ LUT buffer
-	lutSize := (dim + 7) / 8 * 256
-	if cap(s.lut) < lutSize {
-		s.lut = make([]float64, lutSize)
-	} else {
-		s.lut = s.lut[:lutSize]
-	}
+	// Les tampons de plans de bits sont dimensionnés par prepareQueryPlanes,
+	// qui les réalloue seulement si la capacité empruntée au pool est trop petite.
 }
 
 // visit marks a node as visited. Returns true if newly visited, false if already visited.
