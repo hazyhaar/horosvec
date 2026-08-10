@@ -5,3 +5,10 @@ bin/
 *.db-journal
 .env
 .env.local
+
+# Documents de travail internes, non destinés à la publication : consigne de
+# session (CLAUDE.md) et rapports d'audit datés. Ils vivent dans le dépôt de
+# développement et sont déjà écartés de la copie vers cette zone ; l'exclusion
+# est reprise ici pour qu'un ajout manuel ne les réintroduise pas.
+CLAUDE.md
+audits/
