@@ -12,3 +12,4 @@ bin/
 # est reprise ici pour qu'un ajout manuel ne les réintroduise pas.
 CLAUDE.md
 audits/
+notes_analyse_critique.md
