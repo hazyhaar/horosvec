@@ -3,8 +3,10 @@ package horosvec
 import (
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"math"
 )
 
 // hotPlane : vue contiguë et pointer-free des nœuds persistés, pour la boucle chaude.
@@ -13,17 +15,58 @@ import (
 type hotPlane struct {
 	n         int
 	codeBytes int
-	codes     []byte
-	sqNorm    []float64
-	l1Norm    []float64
-	nbrOff    []int32 // n+1 (offsets dans nbrs)
-	nbrs      []int32
-	extOff    []int32 // n+1 (offsets dans extIDs)
-	extIDs    []byte
+
+	// rows entrelace, pour chaque nœud et dans CET ordre, son code, sa norme
+	// carrée et sa norme L1, à pas fixe (rowStride).
+	//
+	// L'entrelacement lui-même ne gagne RIEN, et c'est mesuré. Un micro-banc
+	// comparant quatre agencements sur 26,7 M nœuds — trois tranches séparées,
+	// fusionné à pas 80, fusionné à pas 128 aligné sur les lignes de cache, code
+	// seul plus normes en tranche dense — les donne tous équivalents, entre 62 et
+	// 68 ns par accès, les écarts changeant de signe d'un tour à l'autre. La
+	// version alignée sur 128, qui devrait gagner si les lignes de cache étaient
+	// en cause, ne gagne pas et coûte 60 % de mémoire en plus.
+	//
+	// La raison : à cette échelle, chaque nœud visité coûte un accès aléatoire en
+	// mémoire principale, soit une soixantaine de nanosecondes sur cette machine,
+	// que les données soient dans une, deux ou trois régions. Regrouper trois
+	// accès en un n'aide pas quand aucun des trois n'était prévisible.
+	//
+	// Ce qui est conservé de cette forme : elle porte l'alignement ci-dessous,
+	// qui lui rend vraiment, et elle remplace trois tranches par une.
+	//
+	// La taille du code est arrondie au multiple de 8 supérieur (codeStride), ce
+	// qui aligne le début de chaque code sur huit octets : la boucle de comptage
+	// de bits lit alors des mots de 64 bits sans recomposition. CE point est
+	// mesuré gagnant : la recomposition passe de 12,4 % à 2,3 % du temps
+	// processeur.
+	rows       []byte
+	codeStride int // taille du code arrondie au multiple de 8 supérieur
+	rowStride  int // codeStride + 16 (norme carrée + norme L1, en float64)
+
+	nbrOff []int32 // n+1 (offsets dans nbrs)
+	nbrs   []int32
+	extOff []int32 // n+1 (offsets dans extIDs)
+	extIDs []byte
+}
+
+// initStrides fixe les pas d'entrelacement une fois codeBytes connu.
+func (p *hotPlane) initStrides() {
+	if p.rowStride != 0 {
+		return
+	}
+	p.codeStride = (p.codeBytes + 7) &^ 7
+	p.rowStride = p.codeStride + 16
 }
 
 func codeBytesForDim(codeDim int) int {
 	return (codeDim + 7) / 8
+}
+
+// codeBytesTotal rend la taille COMPLÈTE d'un code : un plan de bits par
+// niveau de quantification. À un bit, elle se confond avec codeBytesForDim.
+func codeBytesTotal(codeDim, codeBits int) int {
+	return codeBytesForDim(codeDim) * normaliseCodeBits(codeBits)
 }
 
 // maxInt32Offset est la plus grande valeur représentable dans un offset int32 du plan chaud.
@@ -42,8 +85,8 @@ func checkInt32Offset(cumulative int64, what string) error {
 }
 
 // buildHotPlane charge tous les nœuds persistés en un seul SELECT ordonné par node_id.
-func buildHotPlane(db *sql.DB, codeDim int) (*hotPlane, error) {
-	codeBytes := codeBytesForDim(codeDim)
+func buildHotPlane(db *sql.DB, codeDim, codeBits int) (*hotPlane, error) {
+	codeBytes := codeBytesTotal(codeDim, codeBits)
 	rows, err := db.Query(
 		"SELECT node_id, ext_id, neighbors, quantized, sq_norm, l1_norm FROM vindex_nodes ORDER BY node_id",
 	)
@@ -77,8 +120,8 @@ func buildHotPlane(db *sql.DB, codeDim int) (*hotPlane, error) {
 }
 
 // buildHotPlaneFromCache construit le plan depuis le cache LRU (mode standalone ImportBinary).
-func buildHotPlaneFromCache(cache *nodeCache, codeDim int, n int) (*hotPlane, error) {
-	codeBytes := codeBytesForDim(codeDim)
+func buildHotPlaneFromCache(cache *nodeCache, codeDim, codeBits int, n int) (*hotPlane, error) {
+	codeBytes := codeBytesTotal(codeDim, codeBits)
 	p := &hotPlane{codeBytes: codeBytes}
 	for nodeID := 0; nodeID < n; nodeID++ {
 		node := cache.getReadOnly(int64(nodeID))
@@ -96,9 +139,12 @@ func buildHotPlaneFromCache(cache *nodeCache, codeDim int, n int) (*hotPlane, er
 }
 
 func (p *hotPlane) appendRow(code []byte, sqNorm, l1Norm float64, extID []byte, neighbors []int64) error {
-	p.codes = append(p.codes, code...)
-	p.sqNorm = append(p.sqNorm, sqNorm)
-	p.l1Norm = append(p.l1Norm, l1Norm)
+	p.initStrides()
+	base := len(p.rows)
+	p.rows = append(p.rows, make([]byte, p.rowStride)...)
+	copy(p.rows[base:base+p.codeBytes], code)
+	binary.LittleEndian.PutUint64(p.rows[base+p.codeStride:], math.Float64bits(sqNorm))
+	binary.LittleEndian.PutUint64(p.rows[base+p.codeStride+8:], math.Float64bits(l1Norm))
 
 	if len(p.nbrOff) == 0 {
 		p.nbrOff = []int32{0}
@@ -137,8 +183,19 @@ func (p *hotPlane) appendNode(code []byte, sqNorm, l1Norm float64, extID []byte,
 }
 
 func (p *hotPlane) codeAt(nodeID int) []byte {
-	off := nodeID * p.codeBytes
-	return p.codes[off : off+p.codeBytes]
+	off := nodeID * p.rowStride
+	return p.rows[off : off+p.codeBytes]
+}
+
+// rowAt rend en une seule lecture le code et les deux normes du nœud. C'est la
+// forme utilisée sur le chemin chaud. Elle ne réduit pas le coût de l'accès —
+// voir le commentaire du champ rows — mais elle évite d'indexer trois tranches.
+func (p *hotPlane) rowAt(nodeID int) ([]byte, float64, float64) {
+	off := nodeID * p.rowStride
+	row := p.rows[off : off+p.rowStride]
+	sq := math.Float64frombits(binary.LittleEndian.Uint64(row[p.codeStride:]))
+	l1 := math.Float64frombits(binary.LittleEndian.Uint64(row[p.codeStride+8:]))
+	return row[:p.codeBytes], sq, l1
 }
 
 func (p *hotPlane) extIDAt(nodeID int) []byte {
@@ -157,9 +214,9 @@ func (idx *Index) rebuildPlaneLocked() error {
 		err   error
 	)
 	if idx.db != nil {
-		plane, err = buildHotPlane(idx.db, idx.codeDim)
+		plane, err = buildHotPlane(idx.db, idx.codeDim, idx.codeBits)
 	} else {
-		plane, err = buildHotPlaneFromCache(idx.cache, idx.codeDim, int(idx.nextID))
+		plane, err = buildHotPlaneFromCache(idx.cache, idx.codeDim, idx.codeBits, int(idx.nextID))
 	}
 	if err != nil {
 		return err
@@ -198,8 +255,8 @@ func (idx *Index) greedyNodeCodeNorms(ctx context.Context, nodeID int64, loadFn 
 		return n.code, n.sqNorm, n.l1Norm, nil
 	}
 	if idx.plane != nil && nodeID >= 0 && nodeID < int64(idx.plane.n) {
-		id := int(nodeID)
-		return idx.plane.codeAt(id), idx.plane.sqNorm[id], idx.plane.l1Norm[id], nil
+		code, sq, l1 := idx.plane.rowAt(int(nodeID))
+		return code, sq, l1, nil
 	}
 	n, err := loadNodeReadOnly(ctx, idx.db, idx.cache, nodeID)
 	if err != nil {
