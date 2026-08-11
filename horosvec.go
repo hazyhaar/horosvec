@@ -73,6 +73,24 @@ type Config struct {
 	// (standard DiskANN). Use BuildWorkers=1 when exact reproducibility is required.
 	BuildWorkers int
 
+	// CodeBits fixe le nombre de bits par dimension du code quantifié, de 1 à 8.
+	//
+	// 1 (défaut) : schéma d'origine, un bit de signe par dimension. Toute autre
+	// valeur produit un code plus large, dont les premiers octets restent
+	// exactement le code à un bit — un index construit à plusieurs bits reste
+	// donc lisible par la voie d'origine si l'on ignore les plans suivants.
+	//
+	// Mesuré sur 100 000 vecteurs en dimension 512 : la présélection des 128
+	// meilleurs candidats par l'estimateur contient 58 % des vrais dix plus
+	// proches voisins à 1 bit, 77 % à 2 bits, 88 % à 3 bits, puis plafonne. Ce
+	// plafond tient à la quantification de la REQUÊTE, indépendante de ce
+	// réglage : au-delà de 4 bits, élargir le code ne rapporte plus.
+	//
+	// Le prix est la mémoire : le code triple à 3 bits, et il réside dans le plan
+	// chaud. La valeur est figée à la construction et persistée ; la changer
+	// impose de reconstruire l'index.
+	CodeBits int
+
 	// PrefetchRerank annonce au noyau, en une fois, les plages de l'arène que la
 	// boucle de re-classement va lire, au lieu de subir un défaut de page servi
 	// séquentiellement par candidat. Sans effet hors mode arène.
@@ -117,6 +135,7 @@ func encodeGraphNodes(
 	allVecs [][]float32,
 	allIDs [][]byte,
 	workers int,
+	codeBits int,
 ) ([]graphNode, error) {
 	n := len(allVecs)
 	nodes := make([]graphNode, n)
@@ -127,7 +146,7 @@ func encodeGraphNodes(
 				return nil, ctx.Err()
 			}
 			rotator.Rotate(v, rotated)
-			code, sqNorm, l1Norm := encoder.Encode(rotated)
+			code, sqNorm, l1Norm := encoder.EncodeMultiBit(rotated, codeBits)
 			nodes[i] = graphNode{
 				id:     int64(i),
 				extID:  allIDs[i],
@@ -175,7 +194,7 @@ func encodeGraphNodes(
 					return
 				}
 				wr.Rotate(allVecs[i], rotated)
-				code, sqNorm, l1Norm := encoder.Encode(rotated)
+				code, sqNorm, l1Norm := encoder.EncodeMultiBit(rotated, codeBits)
 				nodes[i] = graphNode{
 					id:     int64(i),
 					extID:  allIDs[i],
@@ -206,6 +225,7 @@ func DefaultConfig() Config {
 		EfSearch:             128,
 		RerankTopN:           500,
 		PrefetchRerank:       true,
+		CodeBits:             1,
 		CacheCapacity:        100_000,
 		BruteForceThreshold:  50_000,
 		Alpha:                1.2,
@@ -238,6 +258,7 @@ type Index struct {
 	medoid              int64
 	dim                 int
 	codeDim             int
+	codeBits            int // bits par dimension du code quantifié (1 = schéma d'origine)
 	rotator             *Rotator
 	nextID              int64
 	built               bool
@@ -354,6 +375,11 @@ func New(db *sql.DB, cfg Config) (*Index, error) {
 		idx.dim = dim
 		idx.codeDim = rotMeta.codeDim
 		idx.rotator = NewRotatorWithCodeDim(dim, rotMeta.codeDim, rotMeta.rounds, rotMeta.seed)
+		// La largeur du code est celle de l'index PERSISTÉ, jamais celle de la
+		// configuration : un index construit à un bit se relit à un bit, même si
+		// l'appelant en demande davantage. Métadonnée absente = index antérieur à
+		// ce réglage, donc un bit.
+		idx.codeBits = normaliseCodeBits(rotMeta.codeBits)
 		idx.encoder = NewEncoder(centroid)
 		idx.centroid = NewCentroidTracker(dim, cfg.DriftThreshold, cfg.InsertRatioThreshold)
 		idx.centroid.SetCentroid(centroid, int64(nodeCount))
@@ -531,6 +557,7 @@ func (idx *Index) Build(ctx context.Context, iter VectorIterator) error {
 	seed := effectiveRotationSeed(idx.cfg)
 	idx.rotator = NewRotator(dim, rounds, seed)
 	idx.codeDim = idx.rotator.CodeDim()
+	idx.codeBits = normaliseCodeBits(idx.cfg.CodeBits)
 
 	rotated := make([]float32, idx.codeDim)
 	// Accumulation du centroïde en float64 : une somme naïve float32 sur N vecteurs
@@ -555,7 +582,7 @@ func (idx *Index) Build(ctx context.Context, iter VectorIterator) error {
 	idx.centroid.SnapshotBuild()
 
 	buildWorkers := effectiveBuildWorkers(idx.cfg)
-	nodes, err := encodeGraphNodes(ctx, idx.rotator, idx.encoder, allVecs, allIDs, buildWorkers)
+	nodes, err := encodeGraphNodes(ctx, idx.rotator, idx.encoder, allVecs, allIDs, buildWorkers, idx.codeBits)
 	if err != nil {
 		return err
 	}
@@ -583,6 +610,7 @@ func (idx *Index) Build(ctx context.Context, iter VectorIterator) error {
 		seed:     seed,
 		rounds:   rounds,
 		codeDim:  idx.codeDim,
+		codeBits: idx.codeBits,
 		dbFormat: currentDBFormatVersion,
 	}
 	if err := saveGraph(tx, nodes, idx.medoid, dim, idx.cfg.MaxDegree, centroid, rotMeta); err != nil {
@@ -1036,7 +1064,7 @@ func (idx *Index) rabitqGreedySearchInternal(ctx context.Context, query []float3
 	}
 	state.visit(idx.medoid)
 
-	startDist := rabitqDistanceBitProduct(&state.planes, querySqNorm, medoidCode, medoidSq, medoidL1)
+	startDist := rabitqDistanceMultiBit(&state.planes, querySqNorm, medoidCode, codeBytesForDim(idx.codeDim), idx.codeBits, medoidSq, medoidL1)
 
 	state.pushHeap(searchCandidate{nodeID: idx.medoid, dist: startDist})
 	state.insertBest(searchCandidate{nodeID: idx.medoid, dist: startDist}, beamWidth)
@@ -1071,7 +1099,7 @@ func (idx *Index) rabitqGreedySearchInternal(ctx context.Context, query []float3
 				return true
 			}
 
-			d := rabitqDistanceBitProduct(&state.planes, querySqNorm, nbrCode, nbrSq, nbrL1)
+			d := rabitqDistanceMultiBit(&state.planes, querySqNorm, nbrCode, codeBytesForDim(idx.codeDim), idx.codeBits, nbrSq, nbrL1)
 
 			if len(state.best) < beamWidth || d < worstBest {
 				state.pushHeap(searchCandidate{nodeID: nbr, dist: d})
@@ -1243,7 +1271,7 @@ func (idx *Index) Insert(ctx context.Context, vecs [][]float32, ids [][]byte) er
 
 		queryRotated := make([]float32, idx.codeDim)
 		idx.rotator.Rotate(vec, queryRotated)
-		code, sqNorm, l1Norm := idx.encoder.Encode(queryRotated)
+		code, sqNorm, l1Norm := idx.encoder.EncodeMultiBit(queryRotated, idx.codeBits)
 
 		if err := saveNode(tx, nodeID, ids[i], nil, vec, code, sqNorm, l1Norm); err != nil {
 			return fmt.Errorf("horosvec: save new node: %w", err)
@@ -1551,6 +1579,7 @@ func (idx *Index) rebuildInternal(ctx context.Context, iter VectorIterator) {
 		seed := effectiveRotationSeed(idx.cfg)
 		idx.rotator = NewRotator(dim, rounds, seed)
 		idx.codeDim = idx.rotator.CodeDim()
+		idx.codeBits = normaliseCodeBits(idx.cfg.CodeBits)
 	}
 
 	rotated := make([]float32, idx.codeDim)
@@ -1573,7 +1602,7 @@ func (idx *Index) rebuildInternal(ctx context.Context, iter VectorIterator) {
 	enc := NewEncoder(centroid)
 
 	buildWorkers := effectiveBuildWorkers(idx.cfg)
-	nodes, err := encodeGraphNodes(ctx, idx.rotator, enc, allVecs, allIDs, buildWorkers)
+	nodes, err := encodeGraphNodes(ctx, idx.rotator, enc, allVecs, allIDs, buildWorkers, normaliseCodeBits(idx.cfg.CodeBits))
 	if err != nil {
 		return
 	}
@@ -1608,6 +1637,7 @@ func (idx *Index) rebuildInternal(ctx context.Context, iter VectorIterator) {
 		seed:     idx.rotator.Seed(),
 		rounds:   idx.rotator.Rounds(),
 		codeDim:  idx.codeDim,
+		codeBits: idx.codeBits,
 		dbFormat: currentDBFormatVersion,
 	}
 	if err := saveGraph(tx, nodes, medoid, dim, idx.cfg.MaxDegree, centroid, rotMeta); err != nil {
@@ -1624,6 +1654,7 @@ func (idx *Index) rebuildInternal(ctx context.Context, iter VectorIterator) {
 	idx.dim = dim
 	idx.encoder = enc
 	idx.codeDim = idx.rotator.CodeDim()
+	idx.codeBits = normaliseCodeBits(idx.cfg.CodeBits)
 	idx.nextID = int64(len(nodes))
 	idx.centroid = NewCentroidTracker(dim, idx.cfg.DriftThreshold, idx.cfg.InsertRatioThreshold)
 	idx.centroid.AddBatch(allVecs)

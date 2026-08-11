@@ -63,11 +63,12 @@ func TestHotPlane_ConsistencyWithSQL(t *testing.T) {
 		if !bytes.Equal(planeCode, code) {
 			t.Fatalf("node %d: code mismatch", nodeID)
 		}
-		if idx.plane.sqNorm[nodeID] != sqNorm {
-			t.Fatalf("node %d: sqNorm plane=%v sql=%v", nodeID, idx.plane.sqNorm[nodeID], sqNorm)
+		_, planeSq, planeL1 := idx.plane.rowAt(int(nodeID))
+		if planeSq != sqNorm {
+			t.Fatalf("node %d: sqNorm plane=%v sql=%v", nodeID, planeSq, sqNorm)
 		}
-		if idx.plane.l1Norm[nodeID] != l1Norm {
-			t.Fatalf("node %d: l1Norm plane=%v sql=%v", nodeID, idx.plane.l1Norm[nodeID], l1Norm)
+		if planeL1 != l1Norm {
+			t.Fatalf("node %d: l1Norm plane=%v sql=%v", nodeID, planeL1, l1Norm)
 		}
 		if !bytes.Equal(idx.plane.extIDAt(nodeID), extID) {
 			t.Fatalf("node %d: extID mismatch", nodeID)

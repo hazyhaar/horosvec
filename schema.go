@@ -108,6 +108,11 @@ type rotationMeta struct {
 	rounds   int
 	codeDim  int
 	dbFormat int
+	// codeBits : bits par dimension du code quantifié. Zéro à la lecture d'un
+	// index construit avant ce réglage, ce que normaliseCodeBits ramène à 1 —
+	// le schéma d'origine. La valeur est celle de la CONSTRUCTION : elle décrit
+	// le format des codes déjà écrits, jamais un souhait de l'appelant.
+	codeBits int
 }
 
 // saveGraph persists all nodes (avec leur blob vecteur) et les métadonnées d'un build en
@@ -137,6 +142,7 @@ func saveGraphMeta(tx *sql.Tx, medoid int64, dim, maxDegree, nodeCount int, cent
 		"rotation_seed":     serializeInt64(int64(rot.seed)),
 		"rotation_rounds":   serializeInt64(int64(rot.rounds)),
 		"code_dim":          serializeInt64(int64(rot.codeDim)),
+		"code_bits":         serializeInt64(int64(rot.codeBits)),
 	}
 	for k, v := range metas {
 		_, err := tx.Exec(
@@ -237,6 +243,11 @@ func loadRotationMeta(db *sql.DB, dim int) (rotationMeta, error) {
 	}
 	if b, err := loadMeta(db, "code_dim"); err == nil {
 		meta.codeDim = int(deserializeInt64(b))
+	}
+	// Absente sur tout index antérieur à ce réglage : la valeur nulle vaut alors
+	// un bit par dimension, c'est-à-dire le schéma d'origine.
+	if b, err := loadMeta(db, "code_bits"); err == nil {
+		meta.codeBits = int(deserializeInt64(b))
 	}
 	if err := validateRotationMeta(dim, meta.codeDim, meta.rounds); err != nil {
 		return meta, err

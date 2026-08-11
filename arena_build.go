@@ -150,6 +150,7 @@ func (idx *Index) buildFromOpenArena(ctx context.Context, ar *arena, extIDs [][]
 	seed := effectiveRotationSeed(idx.cfg)
 	idx.rotator = NewRotator(dim, rounds, seed)
 	idx.codeDim = idx.rotator.CodeDim()
+	idx.codeBits = normaliseCodeBits(idx.cfg.CodeBits)
 
 	// Centroïde de rotation en flux : décodage à la demande, un vecteur à la fois (slotProbe),
 	// aucun tampon O(N×dim). Sémantique identique au chemin fp32 (mêmes valeurs fp16-arrondies).
@@ -241,6 +242,7 @@ func (idx *Index) buildFromOpenArena(ctx context.Context, ar *arena, extIDs [][]
 		seed:     seed,
 		rounds:   rounds,
 		codeDim:  idx.codeDim,
+		codeBits: idx.codeBits,
 		dbFormat: currentDBFormatVersion,
 	}
 	if err := saveGraphStreamArena(ctx, tx, store, idx.rotator, idx.encoder, ar, extIDs,
@@ -319,7 +321,7 @@ func saveGraphStreamArena(
 			return fmt.Errorf("horosvec: arena decode node %d out of range", i)
 		}
 		rotator.Rotate(buf, rotated)
-		code, sqNorm, l1Norm := encoder.Encode(rotated)
+		code, sqNorm, l1Norm := encoder.EncodeMultiBit(rotated, normaliseCodeBits(rot.codeBits))
 		neighbors := store.loadInto(int64(i), nbrBuf[:0])
 		if err := saveNode(tx, int64(i), extIDs[i], neighbors, nil, code, sqNorm, l1Norm); err != nil {
 			return fmt.Errorf("horosvec: save node %d: %w", i, err)
